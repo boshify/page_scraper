@@ -1,3 +1,3 @@
 Flask
 cloudscraper
-beautifulsoup4
+trafilatura
