@@ -27,7 +27,7 @@ def get_random_user_agent():
 # ────────────────────────────────────────────────────────────────────────────────
 def soft_fail(url, message, reason, http_status=None, extra=None):
     """
-    Always HTTP 200. n8n can branch on $.json.ok === true/false without throwing.
+    Always HTTP 200. Old flows still get legacy fields via 'extra'.
     reason: BLOCKED | EMPTY | EXTRACT_FAIL | TIMEOUT | NETWORK | INPUT | UNKNOWN | UNSUPPORTED_MIME
     """
     payload = {
@@ -49,7 +49,10 @@ def soft_ok(data):
 # ────────────────────────────────────────────────────────────────────────────────
 # Fetch + parsing utilities
 # ────────────────────────────────────────────────────────────────────────────────
-def fetch_with_retries(url, headers, tries=2, timeout=12):
+def fetch_with_retries(url, headers, tries=1, timeout=8):
+    """
+    tries=1, timeout≈8s so total request reliably fits under a 10s n8n node timeout.
+    """
     scraper = cloudscraper.create_scraper()
     last_exc = None
     for i in range(tries):
@@ -115,7 +118,7 @@ def extract_outline(soup):
     """
     body = soup.body or soup
 
-    # Normalize lists/blockquote to paragraphs (to mimic your Apps Script)
+    # Normalize lists/blockquote to paragraphs (mimic Apps Script)
     for tag in body.find_all(["li", "blockquote"]):
         tag.name = "p"
 
@@ -177,10 +180,13 @@ def read_page():
     data = request.get_json(force=True, silent=True) or {}
     url = data.get("url")
     max_chars = int(data.get("max_chars", 5000))
-    include_full_text = bool(data.get("include_full_text", False))
+    # Legacy default: when 'include_full_text' is absent, behave like old service (true)
+    include_full_text = bool(data.get("include_full_text", True))
 
     if not url or not isinstance(url, str) or not url.startswith(("http://", "https://")):
-        return soft_fail(url, "Invalid or missing URL", reason="INPUT")
+        # Legacy keys included so old flows don't break
+        return soft_fail(url, "Invalid or missing URL", reason="INPUT",
+                         extra={"content": "", "length": 0})
 
     headers = {
         "User-Agent": get_random_user_agent(),
@@ -189,25 +195,35 @@ def read_page():
     }
 
     try:
-        resp = fetch_with_retries(url, headers=headers, tries=2, timeout=12)
+        # Fit under 10s total
+        resp = fetch_with_retries(url, headers=headers, tries=1, timeout=8)
         if not resp:
-            return soft_fail(url, "Network error", reason="NETWORK")
+            return soft_fail(url, "Network error", reason="NETWORK",
+                             extra={"content": "", "length": 0})
 
         # Friendly blocked mapping
         if resp.status_code in (401, 403, 429, 451):
-            return soft_fail(url, "Crawlers are blocked", reason="BLOCKED", http_status=resp.status_code)
+            return soft_fail(url, "Crawlers are blocked", reason="BLOCKED",
+                             http_status=resp.status_code,
+                             extra={"content": "", "length": 0})
 
         if resp.status_code != 200:
-            return soft_fail(url, f"Failed to load page (HTTP {resp.status_code})", reason="NETWORK", http_status=resp.status_code)
+            return soft_fail(url, f"Failed to load page (HTTP {resp.status_code})", reason="NETWORK",
+                             http_status=resp.status_code,
+                             extra={"content": "", "length": 0})
 
         # Some sites return non-HTML; bail early
         ctype = resp.headers.get("Content-Type", "").lower()
         if "text/html" not in ctype and "application/xhtml+xml" not in ctype:
-            return soft_fail(url, "Unsupported MIME type", reason="UNSUPPORTED_MIME", http_status=resp.status_code, extra={"content_type": ctype})
+            return soft_fail(url, "Unsupported MIME type", reason="UNSUPPORTED_MIME",
+                             http_status=resp.status_code,
+                             extra={"content": "", "length": 0, "content_type": ctype})
 
         html = resp.text or ""
         if len(html) < 500:
-            return soft_fail(url, "Empty or suspicious page", reason="EMPTY", http_status=resp.status_code)
+            return soft_fail(url, "Empty or suspicious page", reason="EMPTY",
+                             http_status=resp.status_code,
+                             extra={"content": "", "length": 0})
 
         # Parse once, reuse for meta + outline
         soup = clean_dom(html)
@@ -221,8 +237,10 @@ def read_page():
         outline_sections, flat_outline = extract_outline(soup)
 
         if not main_text and not outline_sections:
-            return soft_fail(url, "Could not extract readable content", reason="EXTRACT_FAIL")
+            return soft_fail(url, "Could not extract readable content", reason="EXTRACT_FAIL",
+                             extra={"content": "", "length": 0})
 
+        # Build result
         result = {
             "url": url,
             "canonical": meta.get("canonical") or url,
@@ -239,11 +257,16 @@ def read_page():
             },
         }
 
+        # Legacy fields ALWAYS present (so old flows keep working)
         if include_full_text:
             result["content"] = clamp(main_text, max_chars)
         else:
-            # Provide a small teaser for lightweight flows
-            result["content_preview"] = clamp(main_text[: min(max_chars, 800)], 800)
+            # Even if not requested, keep 'content' for legacy callers but with preview
+            result["content"] = clamp(main_text[: min(max_chars, 800)], 800)
+        result["length"] = len(main_text or "")
+
+        # Also provide a small preview for newer flows
+        result["content_preview"] = clamp(main_text[: min(max_chars, 800)], 800)
 
         return soft_ok(result)
 
@@ -251,10 +274,13 @@ def read_page():
         msg = (str(e) or "Unexpected error")
         low = msg.lower()
         if "timed out" in low or "timeout" in low:
-            return soft_fail(url, "Timeout fetching page", reason="TIMEOUT")
+            return soft_fail(url, "Timeout fetching page", reason="TIMEOUT",
+                             extra={"content": "", "length": 0})
         if "captcha" in low or "cloudflare" in low:
-            return soft_fail(url, "Crawlers are blocked", reason="BLOCKED")
-        return soft_fail(url, msg, reason="UNKNOWN")
+            return soft_fail(url, "Crawlers are blocked", reason="BLOCKED",
+                             extra={"content": "", "length": 0})
+        return soft_fail(url, msg, reason="UNKNOWN",
+                         extra={"content": "", "length": 0})
 
 # ────────────────────────────────────────────────────────────────────────────────
 # Entrypoint
