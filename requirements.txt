@@ -1,3 +1,5 @@
 Flask
 cloudscraper
 trafilatura
+beautifulsoup4
+lxml
