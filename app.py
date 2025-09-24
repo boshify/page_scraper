@@ -4,12 +4,10 @@ import trafilatura
 import random
 import os
 import time
+import re
 from bs4 import BeautifulSoup, Comment
 from urllib.parse import urljoin
 
-# ────────────────────────────────────────────────────────────────────────────────
-# App setup
-# ────────────────────────────────────────────────────────────────────────────────
 app = Flask(__name__)
 
 USER_AGENTS = [
@@ -23,16 +21,12 @@ def get_random_user_agent():
     return random.choice(USER_AGENTS)
 
 # ────────────────────────────────────────────────────────────────────────────────
-# Soft result helpers (keep HTTP 200 for n8n)
+# Soft responses (always HTTP 200 for n8n)
 # ────────────────────────────────────────────────────────────────────────────────
 def soft_fail(url, message, reason, http_status=None, extra=None):
-    """
-    Always HTTP 200. Old flows still get legacy fields via 'extra'.
-    reason: BLOCKED | EMPTY | EXTRACT_FAIL | TIMEOUT | NETWORK | INPUT | UNKNOWN | UNSUPPORTED_MIME
-    """
     payload = {
         "ok": False,
-        "reason": reason,
+        "reason": reason,   # INPUT | NETWORK | BLOCKED | TIMEOUT | EMPTY | EXTRACT_FAIL | UNSUPPORTED_MIME | UNKNOWN
         "message": message,
         "http_status": http_status,
         "url": url,
@@ -47,36 +41,17 @@ def soft_ok(data):
     return jsonify(data), 200
 
 # ────────────────────────────────────────────────────────────────────────────────
-# Fetch + parsing utilities
+# Fetch + basic parse
 # ────────────────────────────────────────────────────────────────────────────────
-def fetch_with_retries(url, headers, tries=1, timeout=8):
-    """
-    tries=1, timeout≈8s so total request reliably fits under a 10s n8n node timeout.
-    """
+def fetch_once(url, headers, timeout=8):
+    """Single try (~8s) to fit under 10s n8n timeout."""
     scraper = cloudscraper.create_scraper()
-    last_exc = None
-    for i in range(tries):
-        try:
-            resp = scraper.get(url, headers=headers, timeout=timeout)
-            if resp.status_code == 200:
-                return resp
-            # Bail early if clearly blocked/rate-limited/geo-blocked
-            if resp.status_code in (401, 403, 429, 451):
-                return resp
-            time.sleep(0.5 + i * 0.6)
-        except Exception as e:
-            last_exc = e
-            time.sleep(0.5 + i * 0.6)
-    if last_exc:
-        raise last_exc
-    return None
+    return scraper.get(url, headers=headers, timeout=timeout)
 
-def clean_dom(html):
+def clean_dom_full(html):
+    """Light global cleaning (used for meta + fallback)."""
     soup = BeautifulSoup(html, "lxml")
-    # Remove noise
     for tag in soup(["script", "style", "noscript", "template"]):
-        tag.decompose()
-    for tag in soup.find_all(["nav", "header", "footer", "aside"]):
         tag.decompose()
     for c in soup.find_all(string=lambda t: isinstance(t, Comment)):
         c.extract()
@@ -84,23 +59,17 @@ def clean_dom(html):
 
 def get_meta(soup, url):
     title = (soup.title.string.strip() if soup.title and soup.title.string else None)
-
     md = soup.find("meta", attrs={"name": "description"})
     meta_description = md["content"].strip() if md and md.get("content") else None
-
     link = soup.find("link", rel=lambda x: x and "canonical" in x)
     canonical = urljoin(url, link["href"]) if link and link.get("href") else url
-
     robots = None
     mr = soup.find("meta", attrs={"name": "robots"})
     if mr and mr.get("content"):
         robots = mr["content"].strip()
-
     lang = soup.html.get("lang").strip() if soup.html and soup.html.get("lang") else None
-
     h1_el = soup.find("h1")
     h1_text = h1_el.get_text(strip=True) if h1_el else None
-
     return {
         "title": title,
         "meta_description": meta_description,
@@ -110,31 +79,58 @@ def get_meta(soup, url):
         "h1": h1_text,
     }
 
-def extract_outline(soup):
-    """
-    Build sections from H2–H6 and paragraphs.
-    Intro paragraphs (before the first heading) are grouped under 'Introduction' (H2).
-    Returns: (sections_list, flat_outline_string)
-    """
-    body = soup.body or soup
+# ────────────────────────────────────────────────────────────────────────────────
+# Outline strictly from <body>
+# ────────────────────────────────────────────────────────────────────────────────
+def looks_menuish(text: str) -> bool:
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    if len(lines) >= 6:
+        short_lines = sum(1 for ln in lines if len(ln) <= 20)
+        if short_lines / max(1, len(lines)) >= 0.7:
+            return True
+    tokens = re.split(r"[,\|/·•]\s*", text)
+    if len(tokens) >= 8:
+        short_tokens = sum(1 for t in tokens if len(t.strip()) <= 12)
+        if short_tokens / max(1, len(tokens)) >= 0.75:
+            return True
+    return False
 
-    # Normalize lists/blockquote to paragraphs (mimic Apps Script)
-    for tag in body.find_all(["li", "blockquote"]):
+def looks_boilerplate(text: str) -> bool:
+    t = text.lower()
+    blacklist = [
+        "you are now leaving", "privacy policy", "terms of service",
+        "article continues after advertisement", "cookie", "consent",
+        "subscribe", "newsletter", "login", "sign up", "join now"
+    ]
+    return any(b in t for b in blacklist)
+
+def extract_outline_from_body(body_root):
+    """Group paragraphs under H2–H6 from <body> only; cap intro; skip menu-ish/boilerplate."""
+    # Normalize lists/blockquote -> p
+    for tag in body_root.find_all(["li", "blockquote"]):
         tag.name = "p"
 
     blocks = []
-    for el in body.find_all(["h2", "h3", "h4", "h5", "h6", "p"]):
+    for el in body_root.find_all(["h2","h3","h4","h5","h6","p"]):
         if el.name == "p":
             txt = el.get_text(" ", strip=True)
-            if len(txt) >= 2:
+            if len(txt) >= 2 and not looks_menuish(txt) and not looks_boilerplate(txt):
                 blocks.append({"tag": "p", "level": 0, "text": txt})
         else:
             txt = el.get_text(" ", strip=True)
             if txt:
                 blocks.append({"tag": el.name, "level": int(el.name[1]), "text": txt})
 
-    sections = []
-    current = None
+    sections, current = [], None
+    intro_used, INTRO_LIMIT = 0, 3
+    seen = set()
+
+    def add_para(s, p):
+        key = p.strip()
+        if key in seen:
+            return
+        seen.add(key)
+        s["paragraphs"].append(p)
 
     def flush():
         nonlocal current
@@ -145,15 +141,20 @@ def extract_outline(soup):
     for b in blocks:
         if b["tag"] == "p":
             if not current:
+                if intro_used >= INTRO_LIMIT:
+                    continue
                 current = {"level": 2, "title": "Introduction", "paragraphs": []}
-            current["paragraphs"].append(b["text"])
+            if current["title"] == "Introduction" and intro_used >= INTRO_LIMIT:
+                continue
+            add_para(current, b["text"])
+            if current["title"] == "Introduction":
+                intro_used += 1
         else:
             flush()
             current = {"level": b["level"], "title": b["text"], "paragraphs": []}
-
     flush()
 
-    # Flat outline string
+    # Flat outline
     lines = []
     for s in sections:
         lines.append(f"H{s['level']}: {s['title']}")
@@ -163,14 +164,92 @@ def extract_outline(soup):
     flat_outline = "\n".join(lines).strip()
     return sections, flat_outline
 
+# ────────────────────────────────────────────────────────────────────────────────
+# Stripped HTML from <body>: classic tags only, minimal attributes
+# ────────────────────────────────────────────────────────────────────────────────
+ALLOWED_TAGS = {
+    # structure
+    "div", "section", "article",
+    # text blocks
+    "p", "h1", "h2", "h3", "h4", "h5", "h6",
+    # lists
+    "ul", "ol", "li",
+    # inline/semantics
+    "a", "span", "strong", "em", "b", "i", "u", "small", "sup", "sub", "code",
+    # media
+    "img",
+    # line breaks / rules
+    "br", "hr",
+}
+
+def sanitize_attrs(tag):
+    # remove all attributes by default
+    tag.attrs = {}
+    # selectively re-add allowed attrs per tag
+    if tag.name == "a":
+        href = tag.get("href") or ""
+        # BeautifulSoup lost attrs after clearing; read from original? Use data we saved.
+        # Instead: we pass original attrs via dict on the tag before clearing? Simpler: skip.
+        # Workaround: we use .get("data-orig-href") if present (we'll stash it beforehand).
+        orig = tag.get("data-orig-href")
+        href = orig or href
+        if href and href.lower().startswith(("http://", "https://", "#", "/")):
+            tag.attrs["href"] = href
+    elif tag.name == "img":
+        src = tag.get("data-orig-src") or tag.get("src") or ""
+        if src.lower().startswith(("http://", "https://", "data:image")):
+            tag.attrs["src"] = src
+        alt = tag.get("data-orig-alt") or tag.get("alt")
+        if alt:
+            tag.attrs["alt"] = alt
+
+def strip_html_from_body(body_root) -> str:
+    """Return inner HTML of <body> with only classic tags and minimal attributes."""
+    # Clone a body-only soup so we can safely mutate
+    body_clone = BeautifulSoup(str(body_root), "lxml").body or BeautifulSoup(str(body_root), "lxml")
+
+    # Remove unwanted elements entirely
+    for tag in body_clone(["script", "style", "noscript", "template", "svg"]):
+        tag.decompose()
+    for c in body_clone.find_all(string=lambda t: isinstance(t, Comment)):
+        c.extract()
+
+    # Stash original href/src/alt before stripping attributes
+    for a in body_clone.find_all("a"):
+        if a.has_attr("href"):
+            a.attrs["data-orig-href"] = a["href"]
+    for img in body_clone.find_all("img"):
+        if img.has_attr("src"):
+            img.attrs["data-orig-src"] = img["src"]
+        if img.has_attr("alt"):
+            img.attrs["data-orig-alt"] = img["alt"]
+
+    # Enforce tag whitelist:
+    # - if tag not allowed, unwrap (keep children text)
+    # - if allowed, drop all attrs then re-apply minimal allowed ones
+    for el in list(body_clone.find_all(True)):
+        if el.name not in ALLOWED_TAGS:
+            el.unwrap()
+        else:
+            sanitize_attrs(el)
+
+    # Remove any helper data-* we added
+    for el in body_clone.find_all(True):
+        for k in list(el.attrs.keys()):
+            if k.startswith("data-"):
+                del el.attrs[k]
+
+    # Return inner HTML of <body> if present, else whole clone
+    if getattr(body_clone, "name", None) == "body":
+        return "".join(str(c) for c in body_clone.contents).strip()
+    return str(body_clone)
+
+# ────────────────────────────────────────────────────────────────────────────────
 def clamp(s, n):
     if not s:
         return s
     return s if len(s) <= n else (s[:n] + "... [truncated]")
 
-# ────────────────────────────────────────────────────────────────────────────────
-# Routes
-# ────────────────────────────────────────────────────────────────────────────────
 @app.route("/")
 def home():
     return "Trafilatura scraper is running."
@@ -180,11 +259,10 @@ def read_page():
     data = request.get_json(force=True, silent=True) or {}
     url = data.get("url")
     max_chars = int(data.get("max_chars", 5000))
-    # Legacy default: when 'include_full_text' is absent, behave like old service (true)
-    include_full_text = bool(data.get("include_full_text", True))
+    include_full_text = bool(data.get("include_full_text", True))  # legacy default
+    return_html = bool(data.get("return_html", False))             # new optional param
 
     if not url or not isinstance(url, str) or not url.startswith(("http://", "https://")):
-        # Legacy keys included so old flows don't break
         return soft_fail(url, "Invalid or missing URL", reason="INPUT",
                          extra={"content": "", "length": 0})
 
@@ -195,13 +273,11 @@ def read_page():
     }
 
     try:
-        # Fit under 10s total
-        resp = fetch_with_retries(url, headers=headers, tries=1, timeout=8)
+        resp = fetch_once(url, headers=headers, timeout=8)
         if not resp:
             return soft_fail(url, "Network error", reason="NETWORK",
                              extra={"content": "", "length": 0})
 
-        # Friendly blocked mapping
         if resp.status_code in (401, 403, 429, 451):
             return soft_fail(url, "Crawlers are blocked", reason="BLOCKED",
                              http_status=resp.status_code,
@@ -212,7 +288,6 @@ def read_page():
                              http_status=resp.status_code,
                              extra={"content": "", "length": 0})
 
-        # Some sites return non-HTML; bail early
         ctype = resp.headers.get("Content-Type", "").lower()
         if "text/html" not in ctype and "application/xhtml+xml" not in ctype:
             return soft_fail(url, "Unsupported MIME type", reason="UNSUPPORTED_MIME",
@@ -225,22 +300,33 @@ def read_page():
                              http_status=resp.status_code,
                              extra={"content": "", "length": 0})
 
-        # Parse once, reuse for meta + outline
-        soup = clean_dom(html)
-        meta = get_meta(soup, url)
+        soup_full = clean_dom_full(html)
+        body = soup_full.body
+        use_body_only = body is not None
 
-        # Main readable text
-        main_text = trafilatura.extract(html) or ""
-        main_text = main_text.strip()
+        # Meta uses full soup (safe regardless)
+        meta = get_meta(soup_full, url)
 
-        # Heading outline
-        outline_sections, flat_outline = extract_outline(soup)
+        # Main text: body-only if available, else fallback to full
+        if use_body_only:
+            body_html = str(body)
+            main_text = trafilatura.extract(body_html) or ""
+        else:
+            main_text = trafilatura.extract(html) or ""
+
+        main_text = (main_text or "").strip()
+
+        # Outline: from body when present; else fallback
+        if use_body_only:
+            outline_sections, flat_outline = extract_outline_from_body(body)
+        else:
+            # fallback: build a pseudo-body soup for outline
+            outline_sections, flat_outline = extract_outline_from_body(soup_full)
 
         if not main_text and not outline_sections:
             return soft_fail(url, "Could not extract readable content", reason="EXTRACT_FAIL",
                              extra={"content": "", "length": 0})
 
-        # Build result
         result = {
             "url": url,
             "canonical": meta.get("canonical") or url,
@@ -249,7 +335,7 @@ def read_page():
             "h1": meta.get("h1"),
             "lang": meta.get("lang"),
             "robots": meta.get("robots"),
-            "outline_sections": outline_sections[:200],  # keep response light
+            "outline_sections": outline_sections[:200],
             "flat_outline": clamp(flat_outline, max_chars),
             "lengths": {
                 "main_text": len(main_text or ""),
@@ -257,16 +343,25 @@ def read_page():
             },
         }
 
-        # Legacy fields ALWAYS present (so old flows keep working)
+        # Legacy fields ALWAYS present (no duplicates elsewhere)
         if include_full_text:
             result["content"] = clamp(main_text, max_chars)
         else:
-            # Even if not requested, keep 'content' for legacy callers but with preview
+            # still keep 'content' for legacy callers, but keep it lightweight
             result["content"] = clamp(main_text[: min(max_chars, 800)], 800)
         result["length"] = len(main_text or "")
 
-        # Also provide a small preview for newer flows
-        result["content_preview"] = clamp(main_text[: min(max_chars, 800)], 800)
+        # Optional stripped HTML (independent of everything else)
+        if return_html:
+            try:
+                if use_body_only:
+                    result["html"] = clamp(strip_html_from_body(body), max_chars)
+                else:
+                    # if no <body>, run stripper on the whole cleaned soup
+                    result["html"] = clamp(strip_html_from_body(soup_full), max_chars)
+            except Exception:
+                # If HTML stripping fails, still return text successfully
+                result["html"] = ""
 
         return soft_ok(result)
 
@@ -282,9 +377,6 @@ def read_page():
         return soft_fail(url, msg, reason="UNKNOWN",
                          extra={"content": "", "length": 0})
 
-# ────────────────────────────────────────────────────────────────────────────────
-# Entrypoint
-# ────────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
