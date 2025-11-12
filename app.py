@@ -8,6 +8,10 @@ import re
 from bs4 import BeautifulSoup, Comment, NavigableString
 from urllib.parse import urljoin
 
+# NEW: robust decoding + mojibake repair
+from charset_normalizer import from_bytes  # pip install charset-normalizer
+from ftfy import fix_text                  # pip install ftfy
+
 app = Flask(__name__)
 
 USER_AGENTS = [
@@ -41,12 +45,28 @@ def soft_ok(data):
     return jsonify(data), 200
 
 # ────────────────────────────────────────────────────────────────────────────────
-# Fetch + basic parse
+# Fetch + robust decode
 # ────────────────────────────────────────────────────────────────────────────────
 def fetch_once(url, headers, timeout=8):
     """Single try (~8s) to fit under 10s n8n timeout."""
     scraper = cloudscraper.create_scraper()
     return scraper.get(url, headers=headers, timeout=timeout)
+
+def robust_decode(content_bytes: bytes, fallback_text: str = "") -> str:
+    """
+    Use charset-normalizer to detect and decode to Unicode, then ftfy to fix mojibake.
+    """
+    try:
+        best = from_bytes(content_bytes).best()
+        if best is not None:
+            # str(best) yields decoded Unicode
+            txt = str(best)
+        else:
+            txt = fallback_text or ""
+    except Exception:
+        txt = fallback_text or ""
+    # Repair mojibake and common punctuation issues
+    return fix_text(txt)
 
 def clean_dom_full(html):
     """Light global cleaning (used for meta + fallback)."""
@@ -56,6 +76,9 @@ def clean_dom_full(html):
     for c in soup.find_all(string=lambda t: isinstance(t, Comment)):
         c.extract()
     return soup
+
+def fix_str(s):
+    return fix_text(s) if isinstance(s, str) else s
 
 def get_meta(soup, url):
     title = (soup.title.string.strip() if soup.title and soup.title.string else None)
@@ -70,41 +93,36 @@ def get_meta(soup, url):
     lang = soup.html.get("lang").strip() if soup.html and soup.html.get("lang") else None
     h1_el = soup.find("h1")
     h1_text = h1_el.get_text(strip=True) if h1_el else None
+    # Fix mojibake in metadata too
     return {
-        "title": title,
-        "meta_description": meta_description,
+        "title": fix_str(title),
+        "meta_description": fix_str(meta_description),
         "canonical": canonical,
         "robots": robots,
         "lang": lang,
-        "h1": h1_text,
+        "h1": fix_str(h1_text),
     }
 
 # ────────────────────────────────────────────────────────────────────────────────
-# Markdown helpers (HTML -> Markdown for headings, links, emphasis, lists, images)
+# Markdown helpers (HTML -> Markdown)
 # ────────────────────────────────────────────────────────────────────────────────
-def md_escape(text: str) -> str:
-    # minimal escape for markdown special chars where needed
-    if not text:
-        return ""
-    return text.replace("\\", "\\\\").replace("*", "\\*").replace("_", "\\_").replace("`", "\\`")
-
 def html_inline_to_md(node) -> str:
     """Convert inline content to Markdown (links, emphasis, code, strong, images)."""
     if isinstance(node, NavigableString):
-        return str(node)
+        return fix_text(str(node))
 
     if not hasattr(node, "name"):
         return ""
 
     name = node.name.lower()
 
-    # Recurse into children to build inner MD
+    # Recurse into children
     inner = "".join(html_inline_to_md(child) for child in node.children)
 
     if name == "a":
         href = node.get("href") or ""
         href = href.strip()
-        text = inner or node.get_text(strip=True)
+        text = inner or fix_text(node.get_text(strip=True))
         if href:
             return f"[{text}]({href})"
         return text
@@ -117,7 +135,7 @@ def html_inline_to_md(node) -> str:
         return f"`{inner}`"
     if name == "img":
         src = node.get("src") or ""
-        alt = node.get("alt") or ""
+        alt = fix_text(node.get("alt") or "")
         if src:
             return f"![{alt}]({src})"
         return ""
@@ -130,17 +148,12 @@ def html_block_to_md(tag) -> str:
     name = tag.name.lower()
     if name == "blockquote":
         text = "".join(html_inline_to_md(c) for c in tag.children).strip()
-        # prefix each line with '> '
-        lines = [ln for ln in re.split(r"\r?\n+", text) if ln.strip()]
+        lines = [fix_text(ln) for ln in re.split(r"\r?\n+", text) if ln.strip()]
         return "\n".join(["> " + ln for ln in lines])
 
     if name == "li":
         text = "".join(html_inline_to_md(c) for c in tag.children).strip()
-        # Numbered if parent is <ol>, otherwise bullet
         if tag.find_parent("ol"):
-            # try to get index (approximate)
-            idx = 1
-            # we won't compute exact position; just use ordered style "1."
             return f"1. {text}"
         return f"- {text}"
 
@@ -150,7 +163,7 @@ def html_block_to_md(tag) -> str:
 
 def heading_md(level_num: int, title: str) -> str:
     level_num = max(1, min(6, int(level_num)))
-    return f'{"#" * level_num} {title}'.strip()
+    return f'{"#" * level_num} {fix_text(title)}'.strip()
 
 # ────────────────────────────────────────────────────────────────────────────────
 # Outline strictly from <body> -> sections + flat Markdown outline
@@ -184,7 +197,6 @@ def extract_outline_from_body(body_root):
     - Blocks are converted to Markdown lines.
     - Returns (sections, flat_markdown_outline)
     """
-    # DO NOT normalize list items to paragraphs; preserve lists
     allowed_blocks = ["h1","h2","h3","h4","h5","h6","p","li","blockquote"]
 
     blocks = []
@@ -195,7 +207,7 @@ def extract_outline_from_body(body_root):
             if len(md_line) >= 2 and not looks_menuish(md_line) and not looks_boilerplate(md_line):
                 blocks.append({"tag": name, "text": md_line})
         else:
-            title = el.get_text(" ", strip=True)
+            title = fix_text(el.get_text(" ", strip=True))
             if title:
                 level_num = int(name[1])
                 blocks.append({"tag": f"h{level_num}", "level": level_num, "title": title})
@@ -220,7 +232,6 @@ def extract_outline_from_body(body_root):
                 "paragraphs": []
             }
         else:
-            # paragraph-ish
             if not current:
                 if intro_used >= INTRO_LIMIT:
                     continue
@@ -234,19 +245,17 @@ def extract_outline_from_body(body_root):
     # Build flat Markdown outline
     md_lines = []
     for s in sections:
-        # Heading line using markdown hashes according to Hn
         n = int(s["level"][1]) if s.get("level") else 2
         md_lines.append(heading_md(n, s["title"]))
         for p in s["paragraphs"]:
-            # Keep spacing between items; bullets/quotes already carry their markers
             md_lines.append(p)
-        md_lines.append("")  # blank line
+        md_lines.append("")
 
     flat_markdown = "\n".join(md_lines).strip()
     return sections, flat_markdown
 
 # ────────────────────────────────────────────────────────────────────────────────
-# Stripped HTML from <body>: classic tags only, minimal attributes (keeps href/src)
+# Stripped HTML from <body>: classic tags only, minimal attributes (preserve a.href, img.src/alt)
 # ────────────────────────────────────────────────────────────────────────────────
 ALLOWED_TAGS = {
     # structure
@@ -265,22 +274,18 @@ ALLOWED_TAGS = {
 
 def strip_html_from_body(body_root) -> str:
     """Return inner HTML of <body> with only classic tags and minimal attributes (preserve a.href, img.src/alt)."""
-    # Clone a body-only soup so we can safely mutate
     body_clone = BeautifulSoup(str(body_root), "lxml").body or BeautifulSoup(str(body_root), "lxml")
 
-    # Remove unwanted elements entirely
     for tag in body_clone(["script", "style", "noscript", "template", "svg"]):
         tag.decompose()
     for c in body_clone.find_all(string=lambda t: isinstance(t, Comment)):
         c.extract()
 
-    # Enforce tag whitelist and minimal attributes
     for el in list(body_clone.find_all(True)):
         name = el.name.lower()
         if name not in ALLOWED_TAGS:
             el.unwrap()
             continue
-        # minimize attributes; keep only a.href and img.src/alt
         if name == "a":
             href = el.get("href")
             el.attrs = {}
@@ -288,17 +293,15 @@ def strip_html_from_body(body_root) -> str:
                 el.attrs["href"] = href.strip()
         elif name == "img":
             src = el.get("src")
-            alt = el.get("alt")
+            alt = fix_text(el.get("alt") or "")
             el.attrs = {}
             if src and src.strip().lower().startswith(("http://", "https://", "data:image")):
                 el.attrs["src"] = src.strip()
             if alt:
                 el.attrs["alt"] = alt
         else:
-            # drop all attributes for other tags
             el.attrs = {}
 
-    # Return inner HTML of <body> if present, else whole clone
     if getattr(body_clone, "name", None) == "body":
         return "".join(str(c) for c in body_clone.contents).strip()
     return str(body_clone)
@@ -318,8 +321,7 @@ def read_page():
     data = request.get_json(force=True, silent=True) or {}
     url = data.get("url")
     max_chars = int(data.get("max_chars", 5000))
-    # include_full_text accepted but ignored (we no longer return 'content')
-    return_html = bool(data.get("return_html", False))  # new optional param
+    return_html = bool(data.get("return_html", False))  # optional param
 
     if not url or not isinstance(url, str) or not url.startswith(("http://", "https://")):
         return soft_fail(url, "Invalid or missing URL", reason="INPUT",
@@ -347,13 +349,14 @@ def read_page():
                              http_status=resp.status_code,
                              extra={"length": 0})
 
-        ctype = resp.headers.get("Content-Type", "").lower()
+        ctype = (resp.headers.get("Content-Type") or "").lower()
         if "text/html" not in ctype and "application/xhtml+xml" not in ctype:
             return soft_fail(url, "Unsupported MIME type", reason="UNSUPPORTED_MIME",
                              http_status=resp.status_code,
                              extra={"length": 0, "content_type": ctype})
 
-        html = resp.text or ""
+        # Robust decode to Unicode, then fix mojibake
+        html = robust_decode(resp.content, fallback_text=resp.text or "")
         if len(html) < 500:
             return soft_fail(url, "Empty or suspicious page", reason="EMPTY",
                              http_status=resp.status_code,
@@ -363,7 +366,7 @@ def read_page():
         body = soup_full.body
         use_body_only = body is not None
 
-        # Meta uses full soup
+        # Meta uses full soup (ftfy already applied in get_meta)
         meta = get_meta(soup_full, url)
 
         # Main text length (for metrics only): from body when present, else full
@@ -371,7 +374,7 @@ def read_page():
             main_text = trafilatura.extract(str(body)) or ""
         else:
             main_text = trafilatura.extract(html) or ""
-        main_text = (main_text or "").strip()
+        main_text = fix_text((main_text or "").strip())
 
         # Outline strictly from body, or fallback to full soup if no body
         if use_body_only:
@@ -408,9 +411,7 @@ def read_page():
                 result["html"] = clamp(strip_html_from_body(body), max_chars)
             else:
                 result["html"] = clamp(strip_html_from_body(soup_full), max_chars)
-        # 12 any other top-level fields (none added)
-        # 13 outline_sections (with requested schema)
-        # Ensure paragraphs are markdown (already are)
+        # 13 outline_sections (Markdown paragraphs, title first, level as 'Hn')
         result["outline_sections"] = outline_sections[:200]
 
         return soft_ok(result)
