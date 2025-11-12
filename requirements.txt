@@ -3,3 +3,5 @@ cloudscraper
 trafilatura
 beautifulsoup4
 lxml
+charset-normalizer
+ftfy
