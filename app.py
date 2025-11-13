@@ -59,17 +59,12 @@ def robust_decode(content_bytes: bytes, fallback_text: str = "") -> str:
     return fix_text(txt)
 
 # ────────────────────────────────────────────────────────────────────────────────
-# Body slicer: prefer exact <body ...>...</body> from raw HTML
+# Body slicer: exact <body ...>...</body> from raw HTML
 # ────────────────────────────────────────────────────────────────────────────────
 BODY_OPEN_RE = re.compile(r"<body\b[^>]*>", re.IGNORECASE | re.DOTALL)
 BODY_CLOSE_RE = re.compile(r"</body\s*>", re.IGNORECASE | re.DOTALL)
 
 def slice_body_html(raw_html: str) -> str | None:
-    """
-    Return the exact substring spanning <body ...> ... </body>.
-    If <body> start is found but </body> missing, slice to end.
-    If not found at all, return None.
-    """
     m_open = BODY_OPEN_RE.search(raw_html)
     if not m_open:
         return None
@@ -159,20 +154,66 @@ def heading_md(level_num: int, title: str) -> str:
     return f'{"#" * level_num} {fix_text(title)}'.strip()
 
 # ────────────────────────────────────────────────────────────────────────────────
-# Body chrome removal (header/nav/footer/aside + ARIA roles)
+# Content focusing (within <body>): pick main/article or best content container
 # ────────────────────────────────────────────────────────────────────────────────
-def strip_body_chrome(soup_like):
-    root = soup_like.body if getattr(soup_like, "body", None) else soup_like
-    # Remove semantic chrome tags
-    for t in root.find_all(["header", "footer", "nav", "aside"]):
+CHROME_ROLES = ['navigation', 'banner', 'contentinfo', 'complementary', 'search']
+CHROME_KEYWORDS = [
+    "nav","menu","breadcrumb","header","footer","sidebar","subscribe","newsletter",
+    "cookie","consent","modal","popup","promo","ad-","ads","advert","banner",
+    "share","social","signup","login"
+]
+
+def looks_chrome(el: Tag) -> bool:
+    attrs = " ".join([el.get("id",""), " ".join(el.get("class", [])), el.get("role","")]).lower()
+    if any(r in attrs for r in CHROME_ROLES):
+        return True
+    return any(k in attrs for k in CHROME_KEYWORDS)
+
+def drop_chrome_blocks(root: Tag):
+    # remove semantic chrome
+    for t in root.find_all(["header","footer","nav","aside"]):
         t.decompose()
-    # Remove by ARIA role (menu/chrome)
-    for t in root.select('[role="navigation"],[role="banner"],[role="contentinfo"],[role="complementary"],[role="search"]'):
-        t.decompose()
-    return root
+    # remove role/keyword chrome
+    for el in list(root.find_all(True)):
+        try:
+            if looks_chrome(el) and len(el.get_text(strip=True)) < 8000:
+                el.decompose()
+        except Exception:
+            continue
+
+def choose_content_root(body_root: Tag) -> Tag:
+    # 1) Prefer <main>
+    main = body_root.find("main")
+    if main:
+        return main
+    # 2) Else prefer <article>
+    article = body_root.find("article")
+    if article:
+        return article
+    # 3) Else pick element with most <p> descendants (good heuristic)
+    best, best_p = body_root, 0
+    for el in body_root.find_all(True):
+        # Skip obvious chrome containers
+        if el.name in ("header","footer","nav","aside"):
+            continue
+        if looks_chrome(el):
+            continue
+        pcount = len(el.find_all("p"))
+        if pcount > best_p:
+            best, best_p = el, pcount
+    return best or body_root
+
+def focus_body_html(body_html: str) -> str:
+    """Body HTML → BeautifulSoup → drop chrome → choose content root → return focused HTML string."""
+    soup = BeautifulSoup(body_html, "lxml")
+    body = soup.body or soup
+    drop_chrome_blocks(body)
+    root = choose_content_root(body)
+    # Return just the chosen root's inner HTML (not the whole body)
+    return "".join(str(c) for c in root.contents) if root else str(body)
 
 # ────────────────────────────────────────────────────────────────────────────────
-# Outline strictly from body (post-chrome-strip) -> sections + flat Markdown
+# Outline from focused body -> sections + flat Markdown
 # ────────────────────────────────────────────────────────────────────────────────
 def looks_menuish(text: str) -> bool:
     lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
@@ -196,14 +237,13 @@ def looks_boilerplate(text: str) -> bool:
     ]
     return any(b in t for b in blacklist)
 
-def extract_outline_from_body_html(body_html: str):
-    soup = BeautifulSoup(body_html, "lxml")
-    body_root = soup.body or soup
-    body_root = strip_body_chrome(body_root)
-
+def extract_outline_from_focused_body(focused_body_html: str):
+    soup = BeautifulSoup(focused_body_html, "lxml")
+    root = soup.body or soup
     allowed_blocks = ["h1","h2","h3","h4","h5","h6","p","li","blockquote"]
+
     blocks = []
-    for el in body_root.find_all(allowed_blocks):
+    for el in root.find_all(allowed_blocks):
         name = el.name.lower()
         if name in ("p", "li", "blockquote"):
             md_line = html_block_to_md(el).strip()
@@ -253,7 +293,7 @@ def extract_outline_from_body_html(body_html: str):
     return sections, flat_markdown
 
 # ────────────────────────────────────────────────────────────────────────────────
-# Stripped HTML from body (post-chrome-strip): classic tags, keep href/src/alt
+# Stripped HTML from focused body: classic tags, keep href/src/alt
 # ────────────────────────────────────────────────────────────────────────────────
 ALLOWED_TAGS = {
     "div","section","article",
@@ -264,17 +304,16 @@ ALLOWED_TAGS = {
     "br","hr",
 }
 
-def strip_html_from_body_html(body_html: str) -> str:
-    soup = BeautifulSoup(body_html, "lxml")
-    body_root = soup.body or soup
-    body_root = strip_body_chrome(body_root)
+def strip_html_from_focused_body(focused_body_html: str) -> str:
+    soup = BeautifulSoup(focused_body_html, "lxml")
+    root = soup.body or soup
 
-    for tag in body_root(["script","style","noscript","template","svg"]):
+    for tag in root(["script","style","noscript","template","svg"]):
         tag.decompose()
-    for c in body_root.find_all(string=lambda t: isinstance(t, Comment)):
+    for c in root.find_all(string=lambda t: isinstance(t, Comment)):
         c.extract()
 
-    for el in list(body_root.find_all(True)):
+    for el in list(root.find_all(True)):
         name = el.name.lower()
         if name not in ALLOWED_TAGS:
             el.unwrap()
@@ -295,9 +334,9 @@ def strip_html_from_body_html(body_html: str) -> str:
         else:
             el.attrs = {}
 
-    if getattr(body_root, "name", None) == "body":
-        return "".join(str(c) for c in body_root.contents).strip()
-    return str(body_root)
+    if getattr(root, "name", None) == "body":
+        return "".join(str(c) for c in root.contents).strip()
+    return str(root)
 
 # ────────────────────────────────────────────────────────────────────────────────
 def clamp(s, n):
@@ -314,7 +353,7 @@ def read_page():
     data = request.get_json(force=True, silent=True) or {}
     url = data.get("url")
     max_chars = int(data.get("max_chars", 5000))
-    return_html = bool(data.get("return_html", False))
+    return_html = bool(data.get("return_html", False))  # optional param
 
     if not url or not isinstance(url, str) or not url.startswith(("http://", "https://")):
         return soft_fail(url, "Invalid or missing URL", reason="INPUT", extra={"length": 0})
@@ -348,16 +387,20 @@ def read_page():
             return soft_fail(url, "Empty or suspicious page", reason="EMPTY",
                              http_status=resp.status_code, extra={"length": 0})
 
-        body_slice = slice_body_html(html)
+        body_slice = slice_body_html(html)  # exact body
         soup_full = clean_dom_full(html)
 
         if body_slice is not None:
-            body_html = body_slice
-            main_text = trafilatura.extract(body_html) or ""
-            sections, flat_md = extract_outline_from_body_html(body_html)
+            # Focus the body to main/article or best content container
+            focused_body_html = focus_body_html(body_slice)
+            main_text = trafilatura.extract(focused_body_html) or ""
+            sections, flat_md = extract_outline_from_focused_body(focused_body_html)
         else:
-            main_text = trafilatura.extract(html) or ""
-            sections, flat_md = extract_outline_from_body_html(str(soup_full))
+            # Fallback: no <body> found — focus from cleaned full soup
+            fallback_html = str(soup_full)
+            focused_body_html = focus_body_html(fallback_html)
+            main_text = trafilatura.extract(focused_body_html) or ""
+            sections, flat_md = extract_outline_from_focused_body(focused_body_html)
 
         main_text = fix_text((main_text or "").strip())
         meta = get_meta(soup_full, url)
@@ -383,10 +426,7 @@ def read_page():
         result["flat_outline"] = clamp(flat_md, max_chars)
 
         if return_html:
-            if body_slice is not None:
-                result["html"] = clamp(strip_html_from_body_html(body_slice), max_chars)
-            else:
-                result["html"] = clamp(strip_html_from_body_html(str(soup_full)), max_chars)
+            result["html"] = clamp(strip_html_from_focused_body(focused_body_html), max_chars)
 
         result["outline_sections"] = sections[:200]
 
