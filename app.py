@@ -3,9 +3,8 @@ import cloudscraper
 import trafilatura
 import random
 import os
-import time
 import re
-from bs4 import BeautifulSoup, Comment, NavigableString
+from bs4 import BeautifulSoup, Comment, NavigableString, Tag
 from urllib.parse import urljoin
 
 # Robust decoding + mojibake repair
@@ -54,10 +53,7 @@ def fetch_once(url, headers, timeout=8):
 def robust_decode(content_bytes: bytes, fallback_text: str = "") -> str:
     try:
         best = from_bytes(content_bytes).best()
-        if best is not None:
-            txt = str(best)
-        else:
-            txt = fallback_text or ""
+        txt = str(best) if best is not None else (fallback_text or "")
     except Exception:
         txt = fallback_text or ""
     return fix_text(txt)
@@ -121,8 +117,6 @@ def get_meta(soup, url):
 # ────────────────────────────────────────────────────────────────────────────────
 # Markdown helpers (HTML -> Markdown)
 # ────────────────────────────────────────────────────────────────────────────────
-from bs4 import Tag
-
 def html_inline_to_md(node) -> str:
     if isinstance(node, NavigableString):
         return fix_text(str(node))
@@ -165,7 +159,20 @@ def heading_md(level_num: int, title: str) -> str:
     return f'{"#" * level_num} {fix_text(title)}'.strip()
 
 # ────────────────────────────────────────────────────────────────────────────────
-# Outline from body -> sections + flat Markdown
+# Body chrome removal (header/nav/footer/aside + ARIA roles)
+# ────────────────────────────────────────────────────────────────────────────────
+def strip_body_chrome(soup_like):
+    root = soup_like.body if getattr(soup_like, "body", None) else soup_like
+    # Remove semantic chrome tags
+    for t in root.find_all(["header", "footer", "nav", "aside"]):
+        t.decompose()
+    # Remove by ARIA role (menu/chrome)
+    for t in root.select('[role="navigation"],[role="banner"],[role="contentinfo"],[role="complementary"],[role="search"]'):
+        t.decompose()
+    return root
+
+# ────────────────────────────────────────────────────────────────────────────────
+# Outline strictly from body (post-chrome-strip) -> sections + flat Markdown
 # ────────────────────────────────────────────────────────────────────────────────
 def looks_menuish(text: str) -> bool:
     lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
@@ -190,11 +197,9 @@ def looks_boilerplate(text: str) -> bool:
     return any(b in t for b in blacklist)
 
 def extract_outline_from_body_html(body_html: str):
-    """
-    Parse the given body HTML snippet into sections and a flat Markdown outline.
-    """
     soup = BeautifulSoup(body_html, "lxml")
-    body_root = soup.body or soup  # handle if user passes inner body only
+    body_root = soup.body or soup
+    body_root = strip_body_chrome(body_root)
 
     allowed_blocks = ["h1","h2","h3","h4","h5","h6","p","li","blockquote"]
     blocks = []
@@ -248,7 +253,7 @@ def extract_outline_from_body_html(body_html: str):
     return sections, flat_markdown
 
 # ────────────────────────────────────────────────────────────────────────────────
-# Stripped HTML from body (preserve a.href, img.src/alt)
+# Stripped HTML from body (post-chrome-strip): classic tags, keep href/src/alt
 # ────────────────────────────────────────────────────────────────────────────────
 ALLOWED_TAGS = {
     "div","section","article",
@@ -262,6 +267,7 @@ ALLOWED_TAGS = {
 def strip_html_from_body_html(body_html: str) -> str:
     soup = BeautifulSoup(body_html, "lxml")
     body_root = soup.body or soup
+    body_root = strip_body_chrome(body_root)
 
     for tag in body_root(["script","style","noscript","template","svg"]):
         tag.decompose()
@@ -308,7 +314,7 @@ def read_page():
     data = request.get_json(force=True, silent=True) or {}
     url = data.get("url")
     max_chars = int(data.get("max_chars", 5000))
-    return_html = bool(data.get("return_html", False))  # optional param
+    return_html = bool(data.get("return_html", False))
 
     if not url or not isinstance(url, str) or not url.startswith(("http://", "https://")):
         return soft_fail(url, "Invalid or missing URL", reason="INPUT", extra={"length": 0})
@@ -337,24 +343,19 @@ def read_page():
             return soft_fail(url, "Unsupported MIME type", reason="UNSUPPORTED_MIME",
                              http_status=resp.status_code, extra={"length": 0, "content_type": ctype})
 
-        # Decode robustly then slice exact <body> range
         html = robust_decode(resp.content, fallback_text=resp.text or "")
         if len(html) < 500:
             return soft_fail(url, "Empty or suspicious page", reason="EMPTY",
                              http_status=resp.status_code, extra={"length": 0})
 
-        body_slice = slice_body_html(html)  # exact <body ...>...</body>, or None
-        # Build soup for meta from the full page (safe)
+        body_slice = slice_body_html(html)
         soup_full = clean_dom_full(html)
 
-        # Outline & text length: prefer body slice, else fallback to full
         if body_slice is not None:
-            # Use the raw body HTML slice for everything body-related
             body_html = body_slice
             main_text = trafilatura.extract(body_html) or ""
             sections, flat_md = extract_outline_from_body_html(body_html)
         else:
-            # Malformed pages without <body>
             main_text = trafilatura.extract(html) or ""
             sections, flat_md = extract_outline_from_body_html(str(soup_full))
 
@@ -365,7 +366,7 @@ def read_page():
             return soft_fail(url, "Could not extract readable content", reason="EXTRACT_FAIL",
                              extra={"length": 0})
 
-        # Assemble result in requested order
+        # Build response in the required order
         result = {}
         result["title"] = meta.get("title")
         result["meta_description"] = meta.get("meta_description")
