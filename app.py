@@ -301,6 +301,7 @@ ALLOWED_TAGS = {
     "ul","ol","li",
     "a","span","strong","em","b","i","u","small","sup","sub","code",
     "img",
+    "table","thead","tbody","tr","th","td",
     "br","hr",
 }
 
@@ -318,6 +319,9 @@ def strip_html_from_focused_body(focused_body_html: str) -> str:
         if name not in ALLOWED_TAGS:
             el.unwrap()
             continue
+        if name in {"table","thead","tbody","tr"}:
+            el.attrs = {}
+            continue
         if name == "a":
             href = (el.get("href") or "").strip()
             el.attrs = {}
@@ -331,6 +335,8 @@ def strip_html_from_focused_body(focused_body_html: str) -> str:
                 el.attrs["src"] = src
             if alt:
                 el.attrs["alt"] = alt
+        elif name in {"th","td"}:
+            el.attrs = {}
         else:
             el.attrs = {}
 
@@ -343,6 +349,65 @@ def clamp(s, n):
     if not s:
         return s
     return s if len(s) <= n else (s[:n] + "... [truncated]")
+
+
+def cell_to_text(cell: Tag) -> str:
+    """Convert a table cell (th/td) to inline Markdown-ish text."""
+    return "".join(html_inline_to_md(c) for c in cell.children).strip()
+
+
+def table_to_markdown(table: Tag) -> str:
+    rows = []
+    headers = None
+
+    for tr in table.find_all("tr"):
+        cells = tr.find_all(["th", "td"])
+        if not cells:
+            continue
+        texts = [cell_to_text(c) for c in cells]
+        if headers is None and any(c.name == "th" for c in cells):
+            headers = texts
+        else:
+            rows.append(texts)
+
+    if not headers and rows:
+        headers = [f"Col {i+1}" for i in range(len(rows[0]))]
+
+    if not headers:
+        return ""
+
+    col_count = max(len(headers), max((len(r) for r in rows), default=0))
+    headers = headers + [""] * (col_count - len(headers))
+    normalized_rows = []
+    for r in rows:
+        normalized_rows.append(r + [""] * (col_count - len(r)))
+
+    lines = ["| " + " | ".join(headers) + " |"]
+    lines.append("| " + " | ".join(["---"] * col_count) + " |")
+    for r in normalized_rows:
+        lines.append("| " + " | ".join(r) + " |")
+
+    caption_el = table.find("caption")
+    caption = fix_text(caption_el.get_text(" ", strip=True)) if caption_el else None
+    md = "\n".join(lines)
+    return (caption + "\n" + md).strip() if caption else md
+
+
+def extract_tables_from_focused_body(focused_body_html: str, max_tables: int = 20):
+    """Extract tables as Markdown strings and cleaned HTML."""
+    soup = BeautifulSoup(focused_body_html, "lxml")
+    tables = []
+    for idx, table in enumerate(soup.find_all("table")):
+        if idx >= max_tables:
+            break
+        md = table_to_markdown(table)
+        cleaned_html = strip_html_from_focused_body(str(table))
+        tables.append({
+            "markdown": md,
+            "html": cleaned_html,
+            "caption": fix_text(table.find("caption").get_text(" ", strip=True)) if table.find("caption") else None,
+        })
+    return tables
 
 @app.route("/")
 def home():
@@ -395,12 +460,14 @@ def read_page():
             focused_body_html = focus_body_html(body_slice)
             main_text = trafilatura.extract(focused_body_html) or ""
             sections, flat_md = extract_outline_from_focused_body(focused_body_html)
+            tables = extract_tables_from_focused_body(focused_body_html)
         else:
             # Fallback: no <body> found — focus from cleaned full soup
             fallback_html = str(soup_full)
             focused_body_html = focus_body_html(fallback_html)
             main_text = trafilatura.extract(focused_body_html) or ""
             sections, flat_md = extract_outline_from_focused_body(focused_body_html)
+            tables = extract_tables_from_focused_body(focused_body_html)
 
         main_text = fix_text((main_text or "").strip())
         meta = get_meta(soup_full, url)
@@ -424,6 +491,14 @@ def read_page():
         }
         result["h1"] = meta.get("h1")
         result["flat_outline"] = clamp(flat_md, max_chars)
+        result["tables"] = [
+            {
+                "markdown": clamp(t.get("markdown"), max_chars),
+                "html": clamp(t.get("html"), max_chars),
+                "caption": t.get("caption"),
+            }
+            for t in tables
+        ]
 
         if return_html:
             result["html"] = clamp(strip_html_from_focused_body(focused_body_html), max_chars)
