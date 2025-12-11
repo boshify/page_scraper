@@ -4,6 +4,7 @@ import trafilatura
 import random
 import os
 import re
+import json
 from bs4 import BeautifulSoup, Comment, NavigableString, Tag
 from urllib.parse import urljoin
 
@@ -281,16 +282,19 @@ def extract_outline_from_focused_body(focused_body_html: str):
 
     flush()
 
+    flat_markdown = sections_to_markdown(sections)
+    return sections, flat_markdown
+
+
+def sections_to_markdown(sections):
     md_lines = []
     for s in sections:
         n = int(s["level"][1]) if s.get("level") else 2
         md_lines.append(heading_md(n, s["title"]))
-        for p in s["paragraphs"]:
+        for p in s.get("paragraphs", []):
             md_lines.append(p)
         md_lines.append("")
-
-    flat_markdown = "\n".join(md_lines).strip()
-    return sections, flat_markdown
+    return "\n".join(md_lines).strip()
 
 # ────────────────────────────────────────────────────────────────────────────────
 # Stripped HTML from focused body: classic tags, keep href/src/alt
@@ -409,6 +413,63 @@ def extract_tables_from_focused_body(focused_body_html: str, max_tables: int = 2
         })
     return tables
 
+
+SCHEMA_LD_JSON_RE = re.compile(r"<script[^>]+type=['\"]application/ld\+json['\"][^>]*>(.*?)</script>", re.IGNORECASE | re.DOTALL)
+SCHEMA_TAG_RE = re.compile(r"<schema[^>]*>(.*?)</schema>", re.IGNORECASE | re.DOTALL)
+
+
+def find_schema_type(data):
+    if isinstance(data, dict):
+        schema_type = data.get("@type")
+        if isinstance(schema_type, list) and schema_type:
+            return str(schema_type[0])
+        if isinstance(schema_type, str):
+            return schema_type
+        for val in data.values():
+            found = find_schema_type(val)
+            if found:
+                return found
+    if isinstance(data, list):
+        for item in data:
+            found = find_schema_type(item)
+            if found:
+                return found
+    return None
+
+
+def extract_schema_markup(raw_html: str):
+    schema_blocks = []
+    for m in SCHEMA_LD_JSON_RE.finditer(raw_html):
+        schema_raw = m.group(1)
+        schema_type = None
+        try:
+            data = json.loads(schema_raw.strip())
+            schema_type = find_schema_type(data)
+        except Exception:
+            schema_type = None
+        schema_blocks.append({"raw": schema_raw, "type": schema_type})
+
+    for m in SCHEMA_TAG_RE.finditer(raw_html):
+        schema_blocks.append({"raw": m.group(1), "type": "schema"})
+
+    return schema_blocks
+
+
+def schema_sections_from_markup(schema_blocks):
+    sections = []
+    for block in schema_blocks:
+        raw = block.get("raw")
+        if not raw:
+            continue
+        title_type = block.get("type")
+        title = f"Schema: {title_type}" if title_type else "Schema Markup"
+        sections.append({
+            "title": title,
+            "level": "H2",
+            "paragraphs": [raw],
+        })
+    return sections
+
 @app.route("/")
 def home():
     return "Trafilatura scraper is running."
@@ -448,6 +509,7 @@ def read_page():
                              http_status=resp.status_code, extra={"length": 0, "content_type": ctype})
 
         html = robust_decode(resp.content, fallback_text=resp.text or "")
+        schema_blocks = extract_schema_markup(html)
         if len(html) < 500:
             return soft_fail(url, "Empty or suspicious page", reason="EMPTY",
                              http_status=resp.status_code, extra={"length": 0})
@@ -472,6 +534,11 @@ def read_page():
         main_text = fix_text((main_text or "").strip())
         meta = get_meta(soup_full, url)
 
+        if schema_blocks:
+            schema_sections = schema_sections_from_markup(schema_blocks)
+            sections.extend(schema_sections)
+            flat_md = sections_to_markdown(sections)
+
         if not main_text and not sections:
             return soft_fail(url, "Could not extract readable content", reason="EXTRACT_FAIL",
                              extra={"length": 0})
@@ -491,6 +558,7 @@ def read_page():
         }
         result["h1"] = meta.get("h1")
         result["flat_outline"] = clamp(flat_md, max_chars)
+        result["schema_markup"] = [block["raw"] for block in schema_blocks if block.get("raw")]
         result["tables"] = [
             {
                 "markdown": clamp(t.get("markdown"), max_chars),
