@@ -481,6 +481,14 @@ def read_page():
     max_chars = int(data.get("max_chars", 5000))
     return_html = bool(data.get("return_html", False))  # optional param
 
+    clean_html_raw = data.get("Clean HTML")
+    if clean_html_raw is None:
+        clean_html_raw = data.get("clean_html", True)
+    if isinstance(clean_html_raw, str):
+        clean_html = clean_html_raw.strip().lower() not in {"false", "0", "no", "off"}
+    else:
+        clean_html = bool(clean_html_raw)
+
     if not url or not isinstance(url, str) or not url.startswith(("http://", "https://")):
         return soft_fail(url, "Invalid or missing URL", reason="INPUT", extra={"length": 0})
 
@@ -520,12 +528,14 @@ def read_page():
         if body_slice is not None:
             # Focus the body to main/article or best content container
             focused_body_html = focus_body_html(body_slice)
+            body_html_for_output = body_slice
             main_text = trafilatura.extract(focused_body_html) or ""
             sections, flat_md = extract_outline_from_focused_body(focused_body_html)
             tables = extract_tables_from_focused_body(focused_body_html)
         else:
             # Fallback: no <body> found — focus from cleaned full soup
             fallback_html = str(soup_full)
+            body_html_for_output = fallback_html
             focused_body_html = focus_body_html(fallback_html)
             main_text = trafilatura.extract(focused_body_html) or ""
             sections, flat_md = extract_outline_from_focused_body(focused_body_html)
@@ -569,7 +579,10 @@ def read_page():
         ]
 
         if return_html:
-            result["html"] = clamp(strip_html_from_focused_body(focused_body_html), max_chars)
+            if clean_html:
+                result["html"] = clamp(strip_html_from_focused_body(focused_body_html), max_chars)
+            else:
+                result["html"] = clamp(body_html_for_output, max_chars)
 
         result["outline_sections"] = sections[:200]
 
