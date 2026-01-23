@@ -771,14 +771,15 @@ def read_page():
             return soft_fail(url, "Unsupported MIME type", reason="UNSUPPORTED_MIME",
                              http_status=resp.status_code, extra={"length": 0, "content_type": ctype})
 
-        html = robust_decode(resp.content, fallback_text=resp.text or "")
+        # Use resp.text directly instead of robust_decode to avoid encoding issues
+        html = resp.text or robust_decode(resp.content, fallback_text="")
         block_marker = None if used_reader else detect_soft_block(html)
         if block_marker:
             reader_resp = FETCH_MANAGER.fetch_reader(url, timeout=20, max_retries=2)
             if reader_resp and reader_resp.status_code == 200:
                 resp = reader_resp
                 used_reader = True
-                html = robust_decode(resp.content, fallback_text=resp.text or "")
+                html = resp.text or robust_decode(resp.content, fallback_text="")
             else:
                 # If reader also fails, still try to extract what we can from the original response
                 pass
@@ -790,7 +791,7 @@ def read_page():
             if reader_resp and reader_resp.status_code == 200:
                 resp = reader_resp
                 used_reader = True
-                html = robust_decode(resp.content, fallback_text=resp.text or "")
+                html = resp.text or robust_decode(resp.content, fallback_text="")
                 schema_blocks = extract_schema_markup(html)
 
         if used_reader and ("text/html" not in ctype and "application/xhtml+xml" not in ctype):
