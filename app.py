@@ -76,6 +76,26 @@ def build_headers(profile: dict) -> dict:
     headers["Referer"] = "https://www.google.com"
     return headers
 
+def build_reader_url(url: str) -> str:
+    return f"https://r.jina.ai/{url}"
+
+def parse_reader_text(text: str):
+    title = None
+    source_url = None
+    content = (text or "").strip()
+    lines = content.splitlines()
+    for line in lines[:10]:
+        low = line.lower()
+        if low.startswith("title:"):
+            title = line.split(":", 1)[1].strip()
+        elif low.startswith("url source:") or low.startswith("source url:"):
+            source_url = line.split(":", 1)[1].strip()
+    for idx, line in enumerate(lines):
+        if line.lower().startswith("markdown content"):
+            content = "\n".join(lines[idx + 1:]).strip()
+            break
+    return title, source_url, content
+
 def detect_soft_block(html: str) -> str | None:
     text = (html or "").lower()
     for marker in SOFT_BLOCK_MARKERS:
@@ -112,6 +132,13 @@ class FetchManager:
         if not session:
             session = cloudscraper.create_scraper()
             self.sessions[key] = session
+        return session
+
+    def get_reader_session(self):
+        session = self.sessions.get("_reader")
+        if not session:
+            session = cloudscraper.create_scraper()
+            self.sessions["_reader"] = session
         return session
 
     def rate_limit(self, key: str, headers: dict):
@@ -165,6 +192,23 @@ class FetchManager:
                     backoff = 0.6 * (2 ** attempt) + random.random() * 0.3
                     time.sleep(backoff)
                     continue
+            return resp
+        return None
+
+    def fetch_reader(self, url: str, timeout: int = 10, max_retries: int = 1):
+        reader_url = build_reader_url(url)
+        for attempt in range(max_retries + 1):
+            profile = random.choice(HEADER_PROFILES)
+            headers = build_headers(profile)
+            headers["Accept"] = "text/plain,text/html;q=0.9,*/*;q=0.8"
+            session = self.get_reader_session()
+            resp = session.get(reader_url, headers=headers, timeout=timeout)
+            if not resp:
+                continue
+            if resp.status_code in (429, 500, 502, 503, 504) and attempt < max_retries:
+                backoff = 0.6 * (2 ** attempt) + random.random() * 0.3
+                time.sleep(backoff)
+                continue
             return resp
         return None
 
@@ -639,50 +683,86 @@ def read_page():
         if not resp:
             return soft_fail(url, "Network error", reason="NETWORK", extra={"length": 0})
 
-        if resp.status_code in (401, 403, 429, 451):
-            return soft_fail(url, "Crawlers are blocked", reason="BLOCKED",
-                             http_status=resp.status_code, extra={"length": 0})
+        used_reader = False
+        if resp.status_code in (401, 403, 429, 451, 503):
+            reader_resp = FETCH_MANAGER.fetch_reader(url, timeout=10, max_retries=1)
+            if reader_resp and reader_resp.status_code == 200:
+                resp = reader_resp
+                used_reader = True
+            else:
+                return soft_fail(url, "Crawlers are blocked", reason="BLOCKED",
+                                 http_status=resp.status_code, extra={"length": 0, "block_type": "cloudflare"})
 
         if resp.status_code != 200:
             return soft_fail(url, f"Failed to load page (HTTP {resp.status_code})", reason="NETWORK",
                              http_status=resp.status_code, extra={"length": 0})
 
         ctype = (resp.headers.get("Content-Type") or "").lower()
-        if "text/html" not in ctype and "application/xhtml+xml" not in ctype:
+        if not used_reader and "text/html" not in ctype and "application/xhtml+xml" not in ctype:
             return soft_fail(url, "Unsupported MIME type", reason="UNSUPPORTED_MIME",
                              http_status=resp.status_code, extra={"length": 0, "content_type": ctype})
 
         html = robust_decode(resp.content, fallback_text=resp.text or "")
-        block_marker = detect_soft_block(html)
+        block_marker = None if used_reader else detect_soft_block(html)
         if block_marker:
-            return soft_fail(url, "Crawlers are blocked", reason="BLOCKED",
-                             http_status=resp.status_code, extra={"length": 0, "block_type": block_marker})
+            reader_resp = FETCH_MANAGER.fetch_reader(url, timeout=10, max_retries=1)
+            if reader_resp and reader_resp.status_code == 200:
+                resp = reader_resp
+                used_reader = True
+                html = robust_decode(resp.content, fallback_text=resp.text or "")
+            else:
+                return soft_fail(url, "Crawlers are blocked", reason="BLOCKED",
+                                 http_status=resp.status_code, extra={"length": 0, "block_type": block_marker})
         schema_blocks = extract_schema_markup(html)
-        if len(html) < 500:
+        if not used_reader and len(html) < 500:
             return soft_fail(url, "Empty or suspicious page", reason="EMPTY",
                              http_status=resp.status_code, extra={"length": 0})
 
-        body_slice = slice_body_html(html)  # exact body
-        soup_full = clean_dom_full(html)
-
-        if body_slice is not None:
-            # Focus the body to main/article or best content container
-            focused_body_html = focus_body_html(body_slice)
-            body_html_for_output = body_slice
-            main_text = trafilatura.extract(focused_body_html) or ""
-            sections, flat_md = extract_outline_from_focused_body(focused_body_html)
-            tables = extract_tables_from_focused_body(focused_body_html)
+        if used_reader and ("text/html" not in ctype and "application/xhtml+xml" not in ctype):
+            title, reader_url, reader_content = parse_reader_text(html)
+            main_text = fix_text(reader_content or html).strip()
+            if not main_text:
+                return soft_fail(url, "Empty or suspicious page", reason="EMPTY",
+                                 http_status=resp.status_code, extra={"length": 0})
+            sections = [{
+                "title": "Content",
+                "level": "H2",
+                "paragraphs": [main_text],
+            }]
+            flat_md = main_text
+            tables = []
+            meta = {
+                "title": title,
+                "meta_description": None,
+                "canonical": reader_url or url,
+                "robots": None,
+                "lang": None,
+                "h1": None,
+            }
+            body_html_for_output = None
+            focused_body_html = None
         else:
-            # Fallback: no <body> found — focus from cleaned full soup
-            fallback_html = str(soup_full)
-            body_html_for_output = fallback_html
-            focused_body_html = focus_body_html(fallback_html)
-            main_text = trafilatura.extract(focused_body_html) or ""
-            sections, flat_md = extract_outline_from_focused_body(focused_body_html)
-            tables = extract_tables_from_focused_body(focused_body_html)
+            body_slice = slice_body_html(html)  # exact body
+            soup_full = clean_dom_full(html)
 
-        main_text = fix_text((main_text or "").strip())
-        meta = get_meta(soup_full, url)
+            if body_slice is not None:
+                # Focus the body to main/article or best content container
+                focused_body_html = focus_body_html(body_slice)
+                body_html_for_output = body_slice
+                main_text = trafilatura.extract(focused_body_html) or ""
+                sections, flat_md = extract_outline_from_focused_body(focused_body_html)
+                tables = extract_tables_from_focused_body(focused_body_html)
+            else:
+                # Fallback: no <body> found — focus from cleaned full soup
+                fallback_html = str(soup_full)
+                body_html_for_output = fallback_html
+                focused_body_html = focus_body_html(fallback_html)
+                main_text = trafilatura.extract(focused_body_html) or ""
+                sections, flat_md = extract_outline_from_focused_body(focused_body_html)
+                tables = extract_tables_from_focused_body(focused_body_html)
+
+            main_text = fix_text((main_text or "").strip())
+            meta = get_meta(soup_full, url)
 
         if schema_blocks:
             schema_sections = schema_sections_from_markup(schema_blocks)
@@ -719,7 +799,9 @@ def read_page():
         ]
 
         if return_html:
-            if clean_html:
+            if used_reader and not body_html_for_output:
+                result["html"] = clamp(main_text, max_chars)
+            elif clean_html:
                 result["html"] = clamp(strip_html_from_focused_body(focused_body_html), max_chars)
             else:
                 result["html"] = clamp(body_html_for_output, max_chars)
