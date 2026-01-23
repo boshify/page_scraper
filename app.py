@@ -5,8 +5,9 @@ import random
 import os
 import re
 import json
+import time
 from bs4 import BeautifulSoup, Comment, NavigableString, Tag
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 
 # Robust decoding + mojibake repair
 from charset_normalizer import from_bytes  # pip install charset-normalizer
@@ -21,8 +22,153 @@ USER_AGENTS = [
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.101 Safari/537.36",
 ]
 
-def get_random_user_agent():
-    return random.choice(USER_AGENTS)
+# ────────────────────────────────────────────────────────────────────────────────
+# Fetch manager: session reuse, rate limiting, retry/backoff, robots crawl-delay
+# ────────────────────────────────────────────────────────────────────────────────
+HEADER_PROFILES = [
+    {
+        "User-Agent": USER_AGENTS[0],
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Upgrade-Insecure-Requests": "1",
+        "sec-ch-ua": "\"Chromium\";v=\"115\", \"Not.A/Brand\";v=\"24\", \"Google Chrome\";v=\"115\"",
+        "sec-ch-ua-mobile": "?0",
+        "sec-ch-ua-platform": "\"Windows\"",
+    },
+    {
+        "User-Agent": USER_AGENTS[1],
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.8",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Upgrade-Insecure-Requests": "1",
+        "sec-ch-ua": "\"Safari\";v=\"15\", \"Not.A/Brand\";v=\"24\"",
+        "sec-ch-ua-mobile": "?0",
+        "sec-ch-ua-platform": "\"macOS\"",
+    },
+    {
+        "User-Agent": USER_AGENTS[2],
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Upgrade-Insecure-Requests": "1",
+        "sec-ch-ua-mobile": "?0",
+        "sec-ch-ua-platform": "\"Windows\"",
+    },
+]
+
+SOFT_BLOCK_MARKERS = [
+    "checking your browser",
+    "enable javascript",
+    "verify you are a human",
+    "please enable cookies",
+    "cloudflare",
+    "access denied",
+    "captcha",
+]
+
+def domain_key(url: str) -> str:
+    parsed = urlparse(url)
+    return (parsed.hostname or "").lower()
+
+def build_headers(profile: dict) -> dict:
+    headers = dict(profile)
+    headers["Referer"] = "https://www.google.com"
+    return headers
+
+def detect_soft_block(html: str) -> str | None:
+    text = (html or "").lower()
+    for marker in SOFT_BLOCK_MARKERS:
+        if marker in text:
+            return marker
+    return None
+
+def parse_crawl_delay(robots_txt: str) -> float | None:
+    current_agent = None
+    for line in (robots_txt or "").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.lower().startswith("user-agent:"):
+            current_agent = line.split(":", 1)[1].strip().lower()
+            continue
+        if line.lower().startswith("crawl-delay:"):
+            if current_agent in ("*", "page_scraper"):
+                val = line.split(":", 1)[1].strip()
+                try:
+                    return float(val)
+                except ValueError:
+                    return None
+    return None
+
+class FetchManager:
+    def __init__(self):
+        self.sessions = {}
+        self.last_request = {}
+        self.robots_cache = {}
+
+    def get_session(self, key: str):
+        session = self.sessions.get(key)
+        if not session:
+            session = cloudscraper.create_scraper()
+            self.sessions[key] = session
+        return session
+
+    def rate_limit(self, key: str, headers: dict):
+        min_delay_ms = int(os.environ.get("MIN_DOMAIN_DELAY_MS", "0"))
+        min_delay = max(0, min_delay_ms) / 1000.0
+        crawl_delay = None
+        if os.environ.get("HONOR_ROBOTS_CRAWL_DELAY", "").lower() in {"1", "true", "yes"}:
+            crawl_delay = self.get_crawl_delay(key, headers)
+        delay = max(min_delay, crawl_delay or 0)
+        if delay <= 0:
+            return
+        last = self.last_request.get(key)
+        if last is None:
+            return
+        elapsed = time.time() - last
+        if elapsed < delay:
+            time.sleep(delay - elapsed)
+
+    def get_crawl_delay(self, key: str, headers: dict) -> float | None:
+        cached = self.robots_cache.get(key)
+        if cached and (time.time() - cached["ts"] < 3600):
+            return cached["delay"]
+        if not key:
+            return None
+        robots_url = f"https://{key}/robots.txt"
+        try:
+            session = self.get_session(key)
+            resp = session.get(robots_url, headers=headers, timeout=5)
+            if resp and resp.status_code == 200:
+                delay = parse_crawl_delay(resp.text)
+            else:
+                delay = None
+        except Exception:
+            delay = None
+        self.robots_cache[key] = {"delay": delay, "ts": time.time()}
+        return delay
+
+    def fetch(self, url: str, timeout: int = 8, max_retries: int = 2):
+        key = domain_key(url)
+        for attempt in range(max_retries + 1):
+            profile = random.choice(HEADER_PROFILES)
+            headers = build_headers(profile)
+            self.rate_limit(key, headers)
+            session = self.get_session(key)
+            resp = session.get(url, headers=headers, timeout=timeout)
+            self.last_request[key] = time.time()
+            if not resp:
+                continue
+            if resp.status_code in (429, 500, 502, 503, 504):
+                if attempt < max_retries:
+                    backoff = 0.6 * (2 ** attempt) + random.random() * 0.3
+                    time.sleep(backoff)
+                    continue
+            return resp
+        return None
+
+FETCH_MANAGER = FetchManager()
 
 # ────────────────────────────────────────────────────────────────────────────────
 # Soft responses (always HTTP 200 for n8n)
@@ -47,10 +193,6 @@ def soft_ok(data):
 # ────────────────────────────────────────────────────────────────────────────────
 # Fetch + robust decode
 # ────────────────────────────────────────────────────────────────────────────────
-def fetch_once(url, headers, timeout=8):
-    scraper = cloudscraper.create_scraper()
-    return scraper.get(url, headers=headers, timeout=timeout)
-
 def robust_decode(content_bytes: bytes, fallback_text: str = "") -> str:
     try:
         best = from_bytes(content_bytes).best()
@@ -492,14 +634,8 @@ def read_page():
     if not url or not isinstance(url, str) or not url.startswith(("http://", "https://")):
         return soft_fail(url, "Invalid or missing URL", reason="INPUT", extra={"length": 0})
 
-    headers = {
-        "User-Agent": get_random_user_agent(),
-        "Referer": "https://www.google.com",
-        "Accept-Language": "en-US,en;q=0.9",
-    }
-
     try:
-        resp = fetch_once(url, headers=headers, timeout=8)
+        resp = FETCH_MANAGER.fetch(url, timeout=8, max_retries=2)
         if not resp:
             return soft_fail(url, "Network error", reason="NETWORK", extra={"length": 0})
 
@@ -517,6 +653,10 @@ def read_page():
                              http_status=resp.status_code, extra={"length": 0, "content_type": ctype})
 
         html = robust_decode(resp.content, fallback_text=resp.text or "")
+        block_marker = detect_soft_block(html)
+        if block_marker:
+            return soft_fail(url, "Crawlers are blocked", reason="BLOCKED",
+                             http_status=resp.status_code, extra={"length": 0, "block_type": block_marker})
         schema_blocks = extract_schema_markup(html)
         if len(html) < 500:
             return soft_fail(url, "Empty or suspicious page", reason="EMPTY",
