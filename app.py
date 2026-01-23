@@ -16,10 +16,12 @@ from ftfy import fix_text                  # pip install ftfy
 app = Flask(__name__)
 
 USER_AGENTS = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/15.3 Safari/605.1.15",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:92.0) Gecko/20100101 Firefox/92.0",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.101 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Edg/120.0.0.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
 ]
 
 # ────────────────────────────────────────────────────────────────────────────────
@@ -28,32 +30,45 @@ USER_AGENTS = [
 HEADER_PROFILES = [
     {
         "User-Agent": USER_AGENTS[0],
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.9",
         "Accept-Encoding": "gzip, deflate, br",
         "Upgrade-Insecure-Requests": "1",
-        "sec-ch-ua": "\"Chromium\";v=\"115\", \"Not.A/Brand\";v=\"24\", \"Google Chrome\";v=\"115\"",
+        "sec-ch-ua": "\"Not_A Brand\";v=\"8\", \"Chromium\";v=\"120\", \"Google Chrome\";v=\"120\"",
         "sec-ch-ua-mobile": "?0",
         "sec-ch-ua-platform": "\"Windows\"",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "none",
+        "Sec-Fetch-User": "?1",
     },
     {
         "User-Agent": USER_AGENTS[1],
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.8",
-        "Accept-Encoding": "gzip, deflate, br",
-        "Upgrade-Insecure-Requests": "1",
-        "sec-ch-ua": "\"Safari\";v=\"15\", \"Not.A/Brand\";v=\"24\"",
-        "sec-ch-ua-mobile": "?0",
-        "sec-ch-ua-platform": "\"macOS\"",
-    },
-    {
-        "User-Agent": USER_AGENTS[2],
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.9",
         "Accept-Encoding": "gzip, deflate, br",
         "Upgrade-Insecure-Requests": "1",
+        "sec-ch-ua": "\"Not_A Brand\";v=\"8\", \"Chromium\";v=\"120\", \"Google Chrome\";v=\"120\"",
+        "sec-ch-ua-mobile": "?0",
+        "sec-ch-ua-platform": "\"macOS\"",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "none",
+        "Sec-Fetch-User": "?1",
+    },
+    {
+        "User-Agent": USER_AGENTS[2],
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Upgrade-Insecure-Requests": "1",
+        "sec-ch-ua": "\"Not_A Brand\";v=\"8\", \"Chromium\";v=\"120\", \"Microsoft Edge\";v=\"120\"",
         "sec-ch-ua-mobile": "?0",
         "sec-ch-ua-platform": "\"Windows\"",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "none",
+        "Sec-Fetch-User": "?1",
     },
 ]
 
@@ -65,6 +80,12 @@ SOFT_BLOCK_MARKERS = [
     "cloudflare",
     "access denied",
     "captcha",
+    "bot detection",
+    "security check",
+    "ddos protection",
+    "cf-browser-verification",
+    "challenge-running",
+    "just a moment",
 ]
 
 def domain_key(url: str) -> str:
@@ -142,7 +163,8 @@ class FetchManager:
         return session
 
     def rate_limit(self, key: str, headers: dict):
-        min_delay_ms = int(os.environ.get("MIN_DOMAIN_DELAY_MS", "0"))
+        min_delay_ms_str = os.environ.get("MIN_DOMAIN_DELAY_MS", "0").strip()
+        min_delay_ms = int(min_delay_ms_str) if min_delay_ms_str else 0
         min_delay = max(0, min_delay_ms) / 1000.0
         crawl_delay = None
         if os.environ.get("HONOR_ROBOTS_CRAWL_DELAY", "").lower() in {"1", "true", "yes"}:
@@ -176,40 +198,54 @@ class FetchManager:
         self.robots_cache[key] = {"delay": delay, "ts": time.time()}
         return delay
 
-    def fetch(self, url: str, timeout: int = 8, max_retries: int = 2):
+    def fetch(self, url: str, timeout: int = 15, max_retries: int = 3):
         key = domain_key(url)
         for attempt in range(max_retries + 1):
             profile = random.choice(HEADER_PROFILES)
             headers = build_headers(profile)
             self.rate_limit(key, headers)
             session = self.get_session(key)
-            resp = session.get(url, headers=headers, timeout=timeout)
-            self.last_request[key] = time.time()
-            if not resp:
-                continue
-            if resp.status_code in (429, 500, 502, 503, 504):
+            try:
+                resp = session.get(url, headers=headers, timeout=timeout, allow_redirects=True)
+                self.last_request[key] = time.time()
+                if not resp:
+                    continue
+                if resp.status_code in (429, 500, 502, 503, 504):
+                    if attempt < max_retries:
+                        backoff = 0.8 * (2 ** attempt) + random.random() * 0.5
+                        time.sleep(backoff)
+                        continue
+                return resp
+            except Exception as e:
                 if attempt < max_retries:
-                    backoff = 0.6 * (2 ** attempt) + random.random() * 0.3
+                    backoff = 0.8 * (2 ** attempt) + random.random() * 0.5
                     time.sleep(backoff)
                     continue
-            return resp
+                raise
         return None
 
-    def fetch_reader(self, url: str, timeout: int = 10, max_retries: int = 1):
+    def fetch_reader(self, url: str, timeout: int = 20, max_retries: int = 2):
         reader_url = build_reader_url(url)
         for attempt in range(max_retries + 1):
             profile = random.choice(HEADER_PROFILES)
             headers = build_headers(profile)
             headers["Accept"] = "text/plain,text/html;q=0.9,*/*;q=0.8"
             session = self.get_reader_session()
-            resp = session.get(reader_url, headers=headers, timeout=timeout)
-            if not resp:
-                continue
-            if resp.status_code in (429, 500, 502, 503, 504) and attempt < max_retries:
-                backoff = 0.6 * (2 ** attempt) + random.random() * 0.3
-                time.sleep(backoff)
-                continue
-            return resp
+            try:
+                resp = session.get(reader_url, headers=headers, timeout=timeout, allow_redirects=True)
+                if not resp:
+                    continue
+                if resp.status_code in (429, 500, 502, 503, 504) and attempt < max_retries:
+                    backoff = 1.0 * (2 ** attempt) + random.random() * 0.5
+                    time.sleep(backoff)
+                    continue
+                return resp
+            except Exception as e:
+                if attempt < max_retries:
+                    backoff = 1.0 * (2 ** attempt) + random.random() * 0.5
+                    time.sleep(backoff)
+                    continue
+                raise
         return None
 
 FETCH_MANAGER = FetchManager()
@@ -403,9 +439,16 @@ def focus_body_html(body_html: str) -> str:
 # Text extraction helpers
 # ────────────────────────────────────────────────────────────────────────────────
 def extract_main_text(focused_html: str, full_html: str | None = None) -> str:
-    text = trafilatura.extract(focused_html) or ""
+    # Try trafilatura with favor_precision=False for broader extraction
+    text = trafilatura.extract(focused_html, favor_precision=False, include_comments=False) or ""
     if not text and full_html:
-        text = trafilatura.extract(full_html) or ""
+        text = trafilatura.extract(full_html, favor_precision=False, include_comments=False) or ""
+    # Try with favor_recall=True as another fallback
+    if not text:
+        text = trafilatura.extract(focused_html, favor_recall=True, include_comments=False) or ""
+    if not text and full_html:
+        text = trafilatura.extract(full_html, favor_recall=True, include_comments=False) or ""
+    # Fallback to BeautifulSoup text extraction
     if not text:
         soup = BeautifulSoup(focused_html, "lxml")
         text = soup.get_text(" ", strip=True)
@@ -679,7 +722,11 @@ def home():
 def read_page():
     data = request.get_json(force=True, silent=True) or {}
     url = data.get("url")
-    max_chars = int(data.get("max_chars", 5000))
+    max_chars_raw = data.get("max_chars", 5000)
+    try:
+        max_chars = int(max_chars_raw) if max_chars_raw not in (None, "") else 5000
+    except (ValueError, TypeError):
+        max_chars = 5000
     return_html = bool(data.get("return_html", False))  # optional param
 
     clean_html_raw = data.get("Clean HTML")
@@ -694,19 +741,26 @@ def read_page():
         return soft_fail(url, "Invalid or missing URL", reason="INPUT", extra={"length": 0})
 
     try:
-        resp = FETCH_MANAGER.fetch(url, timeout=8, max_retries=2)
+        resp = FETCH_MANAGER.fetch(url, timeout=15, max_retries=3)
         if not resp:
-            return soft_fail(url, "Network error", reason="NETWORK", extra={"length": 0})
-
-        used_reader = False
-        if resp.status_code in (401, 403, 429, 451, 503):
-            reader_resp = FETCH_MANAGER.fetch_reader(url, timeout=10, max_retries=1)
+            # If direct fetch fails, try reader immediately
+            reader_resp = FETCH_MANAGER.fetch_reader(url, timeout=20, max_retries=2)
             if reader_resp and reader_resp.status_code == 200:
                 resp = reader_resp
                 used_reader = True
             else:
-                return soft_fail(url, "Crawlers are blocked", reason="BLOCKED",
-                                 http_status=resp.status_code, extra={"length": 0, "block_type": "cloudflare"})
+                return soft_fail(url, "Network error - unable to fetch page", reason="NETWORK", extra={"length": 0})
+        else:
+            used_reader = False
+            # If we get blocked status codes, try reader
+            if resp.status_code in (401, 403, 429, 451, 503):
+                reader_resp = FETCH_MANAGER.fetch_reader(url, timeout=20, max_retries=2)
+                if reader_resp and reader_resp.status_code == 200:
+                    resp = reader_resp
+                    used_reader = True
+                else:
+                    return soft_fail(url, "Crawlers are blocked", reason="BLOCKED",
+                                     http_status=resp.status_code, extra={"length": 0, "block_type": "access_denied"})
 
         if resp.status_code != 200:
             return soft_fail(url, f"Failed to load page (HTTP {resp.status_code})", reason="NETWORK",
@@ -720,18 +774,24 @@ def read_page():
         html = robust_decode(resp.content, fallback_text=resp.text or "")
         block_marker = None if used_reader else detect_soft_block(html)
         if block_marker:
-            reader_resp = FETCH_MANAGER.fetch_reader(url, timeout=10, max_retries=1)
+            reader_resp = FETCH_MANAGER.fetch_reader(url, timeout=20, max_retries=2)
             if reader_resp and reader_resp.status_code == 200:
                 resp = reader_resp
                 used_reader = True
                 html = robust_decode(resp.content, fallback_text=resp.text or "")
             else:
-                return soft_fail(url, "Crawlers are blocked", reason="BLOCKED",
-                                 http_status=resp.status_code, extra={"length": 0, "block_type": block_marker})
+                # If reader also fails, still try to extract what we can from the original response
+                pass
         schema_blocks = extract_schema_markup(html)
-        if not used_reader and len(html) < 500:
-            return soft_fail(url, "Empty or suspicious page", reason="EMPTY",
-                             http_status=resp.status_code, extra={"length": 0})
+        if not used_reader and len(html) < 200:
+            # Very short HTML might indicate an error page, but don't fail immediately
+            # Let's try reader as a fallback
+            reader_resp = FETCH_MANAGER.fetch_reader(url, timeout=20, max_retries=2)
+            if reader_resp and reader_resp.status_code == 200:
+                resp = reader_resp
+                used_reader = True
+                html = robust_decode(resp.content, fallback_text=resp.text or "")
+                schema_blocks = extract_schema_markup(html)
 
         if used_reader and ("text/html" not in ctype and "application/xhtml+xml" not in ctype):
             title, reader_url, reader_content = parse_reader_text(html)
@@ -835,5 +895,6 @@ def read_page():
         return soft_fail(url, msg, reason="UNKNOWN", extra={"length": 0})
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
+    port_str = os.environ.get("PORT", "5000").strip()
+    port = int(port_str) if port_str else 5000
     app.run(host="0.0.0.0", port=port)
