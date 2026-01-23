@@ -400,6 +400,21 @@ def focus_body_html(body_html: str) -> str:
     return "".join(str(c) for c in root.contents) if root else str(body)
 
 # ────────────────────────────────────────────────────────────────────────────────
+# Text extraction helpers
+# ────────────────────────────────────────────────────────────────────────────────
+def extract_main_text(focused_html: str, full_html: str | None = None) -> str:
+    text = trafilatura.extract(focused_html) or ""
+    if not text and full_html:
+        text = trafilatura.extract(full_html) or ""
+    if not text:
+        soup = BeautifulSoup(focused_html, "lxml")
+        text = soup.get_text(" ", strip=True)
+    if not text and full_html:
+        soup = BeautifulSoup(full_html, "lxml")
+        text = soup.get_text(" ", strip=True)
+    return fix_text(text.strip())
+
+# ────────────────────────────────────────────────────────────────────────────────
 # Outline from focused body -> sections + flat Markdown
 # ────────────────────────────────────────────────────────────────────────────────
 def looks_menuish(text: str) -> bool:
@@ -749,7 +764,7 @@ def read_page():
                 # Focus the body to main/article or best content container
                 focused_body_html = focus_body_html(body_slice)
                 body_html_for_output = body_slice
-                main_text = trafilatura.extract(focused_body_html) or ""
+                main_text = extract_main_text(focused_body_html, full_html=html)
                 sections, flat_md = extract_outline_from_focused_body(focused_body_html)
                 tables = extract_tables_from_focused_body(focused_body_html)
             else:
@@ -757,7 +772,7 @@ def read_page():
                 fallback_html = str(soup_full)
                 body_html_for_output = fallback_html
                 focused_body_html = focus_body_html(fallback_html)
-                main_text = trafilatura.extract(focused_body_html) or ""
+                main_text = extract_main_text(focused_body_html, full_html=fallback_html)
                 sections, flat_md = extract_outline_from_focused_body(focused_body_html)
                 tables = extract_tables_from_focused_body(focused_body_html)
 
