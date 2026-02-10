@@ -718,6 +718,30 @@ def schema_sections_from_markup(schema_blocks):
 def home():
     return "Trafilatura scraper is running."
 
+def extract_sitemap_urls(html_or_xml: str, base_url: str) -> list[str]:
+    """Extract a list of URLs from sitemap XML or from HTML <a href>. Returns absolute URLs only."""
+    urls = []
+    text = (html_or_xml or "").strip()
+    if not text:
+        return urls
+    # XML sitemap: <loc>...</loc>
+    if "<loc>" in text or "</loc>" in text:
+        for m in re.finditer(r"<loc>\s*([^<]+?)\s*</loc>", text, re.IGNORECASE):
+            u = m.group(1).strip()
+            if u.startswith("http://") or u.startswith("https://"):
+                urls.append(u)
+        return urls
+    # HTML: all <a href="...">
+    soup = BeautifulSoup(text, "lxml")
+    for a in soup.find_all("a", href=True):
+        href = (a["href"] or "").strip()
+        if href.startswith("http://") or href.startswith("https://"):
+            urls.append(href)
+        elif href.startswith("/") or href.startswith("#") or ":" not in href:
+            urls.append(urljoin(base_url, href))
+    return urls
+
+
 @app.route("/read", methods=["POST"])
 def read_page():
     data = request.get_json(force=True, silent=True) or {}
@@ -728,6 +752,10 @@ def read_page():
     except (ValueError, TypeError):
         max_chars = 5000
     return_html = bool(data.get("return_html", False))  # optional param
+
+    # is_sitemap: when true, return only a JSON list of URLs (sitemap only)
+    is_sitemap_raw = data.get("is_sitemap") or data.get("Is Sitemap")
+    is_sitemap = is_sitemap_raw in (True, "true", "1", 1) if is_sitemap_raw is not None else False
 
     clean_html_raw = data.get("Clean HTML")
     if clean_html_raw is None:
@@ -793,6 +821,11 @@ def read_page():
                 used_reader = True
                 html = resp.text or robust_decode(resp.content, fallback_text="")
                 schema_blocks = extract_schema_markup(html)
+
+        # Sitemap-only mode: return list of URLs as JSON, nothing else
+        if is_sitemap:
+            urls = extract_sitemap_urls(html, url)
+            return jsonify({"ok": True, "urls": urls}), 200
 
         if used_reader and ("text/html" not in ctype and "application/xhtml+xml" not in ctype):
             title, reader_url, reader_content = parse_reader_text(html)
