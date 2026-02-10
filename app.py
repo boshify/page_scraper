@@ -795,7 +795,10 @@ def read_page():
                              http_status=resp.status_code, extra={"length": 0})
 
         ctype = (resp.headers.get("Content-Type") or "").lower()
-        if not used_reader and "text/html" not in ctype and "application/xhtml+xml" not in ctype:
+        allowed_mime = "text/html" in ctype or "application/xhtml+xml" in ctype
+        if is_sitemap:
+            allowed_mime = allowed_mime or "text/xml" in ctype or "application/xml" in ctype
+        if not used_reader and not allowed_mime:
             return soft_fail(url, "Unsupported MIME type", reason="UNSUPPORTED_MIME",
                              http_status=resp.status_code, extra={"length": 0, "content_type": ctype})
 
