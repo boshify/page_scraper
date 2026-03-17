@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, g
 import cloudscraper
 import trafilatura
 import random
@@ -6,6 +6,9 @@ import os
 import re
 import json
 import time
+import logging
+import concurrent.futures
+from collections import defaultdict
 from bs4 import BeautifulSoup, Comment, NavigableString, Tag
 from urllib.parse import urljoin, urlparse
 
@@ -14,6 +17,203 @@ from charset_normalizer import from_bytes  # pip install charset-normalizer
 from ftfy import fix_text                  # pip install ftfy
 
 app = Flask(__name__)
+
+# ────────────────────────────────────────────────────────────────────────────────
+# Structured JSON request logging
+# ────────────────────────────────────────────────────────────────────────────────
+logging.basicConfig(level=logging.INFO, format="%(message)s")
+logger = logging.getLogger("pagescraper")
+
+# ────────────────────────────────────────────────────────────────────────────────
+# Adaptive rate limiter: escalating punishment, fast rejects, good actors unaffected
+# ────────────────────────────────────────────────────────────────────────────────
+class AbuseDetector:
+    """Detects abuse by pattern, not just volume.
+
+    Legitimate use: research workflow reading 50 diverse pages in a burst.
+    Abuse: scraping one domain endlessly, or firehosing hundreds of requests.
+
+    Signals that trigger escalation:
+      1. Same-domain concentration — 80%+ of recent requests target one domain
+      2. Extreme volume — raw RPM far above any legitimate workflow
+      3. Sustained pressure — abuse signals persist across multiple windows
+
+    Good actors are never affected, even at high throughput.
+    """
+
+    def __init__(self):
+        # Thresholds (configurable via env)
+        self.global_rpm_hard = int(os.environ.get("RATE_LIMIT_GLOBAL_RPM", "200"))
+        self.same_domain_threshold = 20    # same domain hits in 5 min window
+        self.same_domain_ratio = 0.8       # 80%+ of requests to one domain = suspicious
+        self.extreme_rpm = int(os.environ.get("RATE_LIMIT_EXTREME_RPM", "120"))  # per-IP
+        self.window = 300  # 5 minute sliding window for pattern detection
+        self.base_ban = 60
+        self.max_ban = 3600
+
+        self.ip_hits = defaultdict(list)          # ip -> [(timestamp, domain)]
+        self.global_hits = []                      # [timestamp]
+        self.violations = defaultdict(lambda: {"count": 0, "last": 0.0})
+        self.bans = {}                             # ip -> {"until": float, "level": int}
+        self._last_cleanup = 0.0
+
+    def _cleanup(self, now):
+        if now - self._last_cleanup < 30:
+            return
+        self._last_cleanup = now
+        cutoff = now - self.window * 2
+        for ip in list(self.ip_hits):
+            self.ip_hits[ip] = [(t, d) for t, d in self.ip_hits[ip] if t > cutoff]
+            if not self.ip_hits[ip]:
+                del self.ip_hits[ip]
+        self.global_hits = [t for t in self.global_hits if t > cutoff]
+        # Decay violations after 10 min of no new violations
+        for ip in list(self.violations):
+            v = self.violations[ip]
+            if v["count"] > 0 and now - v["last"] > 600:
+                v["count"] = max(0, v["count"] // 2)
+                v["last"] = now
+            if v["count"] == 0:
+                del self.violations[ip]
+                self.bans.pop(ip, None)
+
+    def _caller_ip(self):
+        return request.headers.get("X-Forwarded-For", request.remote_addr) or "unknown"
+
+    def _detect_abuse(self, ip, now):
+        """Returns abuse reason string or None if behavior looks legitimate."""
+        cutoff = now - self.window
+        recent = [(t, d) for t, d in self.ip_hits.get(ip, []) if t > cutoff]
+        total = len(recent)
+        if total < 10:
+            return None  # not enough data to judge
+
+        # Signal 1: extreme raw volume (per IP per minute)
+        one_min_ago = now - 60
+        rpm = sum(1 for t, _ in recent if t > one_min_ago)
+        if rpm >= self.extreme_rpm:
+            return "EXTREME_VOLUME"
+
+        # Signal 2: same-domain concentration (scraping one site)
+        domain_counts = defaultdict(int)
+        for _, d in recent:
+            if d:
+                domain_counts[d] += 1
+        if domain_counts:
+            top_domain, top_count = max(domain_counts.items(), key=lambda x: x[1])
+            if top_count >= self.same_domain_threshold and top_count / total >= self.same_domain_ratio:
+                return f"DOMAIN_SCRAPING:{top_domain}"
+
+        return None
+
+    def check(self, target_url=None):
+        """Returns (allowed: bool, reason: str|None, retry_after: int|None)."""
+        now = time.time()
+        ip = self._caller_ip()
+        self._cleanup(now)
+
+        # ── Cheapest check: active ban ──
+        ban = self.bans.get(ip)
+        if ban and now < ban["until"]:
+            remaining = int(ban["until"] - now) + 1
+            return False, "BANNED", remaining
+
+        # Parse target domain
+        target_domain = urlparse(target_url).hostname if target_url else None
+
+        # Record hit
+        self.ip_hits[ip].append((now, target_domain))
+        self.global_hits.append(now)
+
+        # ── Global safety valve ──
+        one_min_ago = now - 60
+        global_rpm = sum(1 for t in self.global_hits if t > one_min_ago)
+        if global_rpm >= self.global_rpm_hard:
+            return False, "GLOBAL_LIMIT", 3
+
+        # ── Pattern-based abuse detection ──
+        abuse_reason = self._detect_abuse(ip, now)
+        if not abuse_reason:
+            return True, None, None  # legitimate — no limits
+
+        # Escalate
+        v = self.violations[ip]
+        v["count"] += 1
+        v["last"] = now
+
+        if v["count"] <= 2:
+            # First offenses: soft reject, let them self-correct
+            return False, abuse_reason, 5
+
+        # Repeated abuse: escalating bans
+        level = min(v["count"] - 2, 8)
+        duration = min(self.base_ban * (2 ** level), self.max_ban)
+        self.bans[ip] = {"until": now + duration, "level": level}
+        return False, f"BANNED:{abuse_reason}", int(duration)
+
+
+RATE_LIMITER = AbuseDetector()
+
+
+@app.before_request
+def _pre_request():
+    g.req_start = time.time()
+    g.req_url = None
+    g.rate_limit_reason = None
+
+    # Abuse detection on POST endpoints (i.e., /read)
+    if request.method == "POST":
+        body = request.get_json(force=True, silent=True) or {}
+        target_url = body.get("url")
+        g.req_url = target_url
+        allowed, reason, retry_after = RATE_LIMITER.check(target_url=target_url)
+        if not allowed:
+            g.rate_limit_reason = reason
+            resp = jsonify({
+                "ok": False,
+                "reason": reason,
+                "message": f"Rate limited: {reason}",
+                "retry_after": retry_after,
+            })
+            resp.status_code = 429
+            resp.headers["Retry-After"] = str(retry_after or 5)
+            return resp
+
+
+@app.after_request
+def _log_request(response):
+    elapsed = round(time.time() - getattr(g, "req_start", time.time()), 3)
+    target_url = getattr(g, "req_url", None)
+
+    ok = None
+    reason = None
+    content_length = 0
+    try:
+        resp_data = response.get_json(silent=True)
+        if resp_data and isinstance(resp_data, dict):
+            ok = resp_data.get("ok")
+            reason = resp_data.get("reason")
+            content_length = resp_data.get("length", 0)
+    except Exception:
+        pass
+
+    log_entry = {
+        "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "method": request.method,
+        "path": request.path,
+        "target_url": target_url,
+        "target_domain": urlparse(target_url).hostname if target_url else None,
+        "caller_ip": request.headers.get("X-Forwarded-For", request.remote_addr),
+        "caller_ua": request.headers.get("User-Agent"),
+        "status": response.status_code,
+        "ok": ok,
+        "reason": reason,
+        "rate_limited": getattr(g, "rate_limit_reason", None),
+        "content_length": content_length,
+        "elapsed_s": elapsed,
+    }
+    logger.info(json.dumps(log_entry))
+    return response
 
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -249,6 +449,19 @@ class FetchManager:
         return None
 
 FETCH_MANAGER = FetchManager()
+
+# Thread-pool for hard-timeout wrapper — lets us abort hanging cloudscraper calls
+_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=4)
+
+
+def fetch_with_hard_timeout(fn, hard_limit_seconds):
+    """Run fn() in a thread; raise TimeoutError if it doesn't finish in time."""
+    future = _EXECUTOR.submit(fn)
+    try:
+        return future.result(timeout=hard_limit_seconds)
+    except concurrent.futures.TimeoutError:
+        future.cancel()
+        raise TimeoutError(f"Hard timeout after {hard_limit_seconds}s")
 
 # ────────────────────────────────────────────────────────────────────────────────
 # Soft responses (always HTTP 200 for n8n)
@@ -746,7 +959,32 @@ def extract_sitemap_urls(html_or_xml: str, base_url: str) -> list[str]:
 def read_page():
     data = request.get_json(force=True, silent=True) or {}
     url = data.get("url")
+    g.req_url = url
     max_chars_raw = data.get("max_chars", 5000)
+    # Fast-mode + hard wall-clock cap so upstream timeouts don't exceed client limits
+    fast_mode_raw = data.get("fast_mode")
+    if fast_mode_raw is None:
+        fast_mode = True
+    elif isinstance(fast_mode_raw, str):
+        fast_mode = fast_mode_raw.strip().lower() in {"1", "true", "yes", "on"}
+    else:
+        fast_mode = bool(fast_mode_raw)
+
+    # Derive internal timeouts based on mode – keep well under n8n's HTTP timeout
+    if fast_mode:
+        fetch_timeout = 4
+        fetch_retries = 1
+        reader_timeout = 4
+        reader_retries = 1
+        hard_limit = float(os.environ.get("READ_HARD_TIMEOUT_SECONDS", "8") or "8")
+    else:
+        fetch_timeout = 15
+        fetch_retries = 3
+        reader_timeout = 20
+        reader_retries = 2
+        hard_limit = float(os.environ.get("READ_HARD_TIMEOUT_SECONDS", "25") or "25")
+
+    start_ts = time.time()
     try:
         max_chars = int(max_chars_raw) if max_chars_raw not in (None, "") else 5000
     except (ValueError, TypeError):
@@ -769,26 +1007,33 @@ def read_page():
         return soft_fail(url, "Invalid or missing URL", reason="INPUT", extra={"length": 0})
 
     try:
-        resp = FETCH_MANAGER.fetch(url, timeout=15, max_retries=3)
+        def _do_fetch():
+            """Fetch logic that runs inside the hard-timeout wrapper."""
+            _resp = FETCH_MANAGER.fetch(url, timeout=fetch_timeout, max_retries=fetch_retries)
+            _used_reader = False
+            if not _resp:
+                _rr = FETCH_MANAGER.fetch_reader(url, timeout=reader_timeout, max_retries=reader_retries)
+                if _rr and _rr.status_code == 200:
+                    return _rr, True
+                return None, False
+            if _resp.status_code in (401, 403, 429, 451, 503):
+                _rr = FETCH_MANAGER.fetch_reader(url, timeout=reader_timeout, max_retries=reader_retries)
+                if _rr and _rr.status_code == 200:
+                    return _rr, True
+                return _resp, False
+            return _resp, _used_reader
+
+        try:
+            resp, used_reader = fetch_with_hard_timeout(_do_fetch, hard_limit)
+        except TimeoutError:
+            return soft_fail(url, "Timeout fetching page", reason="TIMEOUT", extra={"length": 0})
+
         if not resp:
-            # If direct fetch fails, try reader immediately
-            reader_resp = FETCH_MANAGER.fetch_reader(url, timeout=20, max_retries=2)
-            if reader_resp and reader_resp.status_code == 200:
-                resp = reader_resp
-                used_reader = True
-            else:
-                return soft_fail(url, "Network error - unable to fetch page", reason="NETWORK", extra={"length": 0})
-        else:
-            used_reader = False
-            # If we get blocked status codes, try reader
-            if resp.status_code in (401, 403, 429, 451, 503):
-                reader_resp = FETCH_MANAGER.fetch_reader(url, timeout=20, max_retries=2)
-                if reader_resp and reader_resp.status_code == 200:
-                    resp = reader_resp
-                    used_reader = True
-                else:
-                    return soft_fail(url, "Crawlers are blocked", reason="BLOCKED",
-                                     http_status=resp.status_code, extra={"length": 0, "block_type": "access_denied"})
+            return soft_fail(url, "Network error - unable to fetch page", reason="NETWORK", extra={"length": 0})
+
+        if not used_reader and resp.status_code in (401, 403, 429, 451, 503):
+            return soft_fail(url, "Crawlers are blocked", reason="BLOCKED",
+                             http_status=resp.status_code, extra={"length": 0, "block_type": "access_denied"})
 
         if resp.status_code != 200:
             return soft_fail(url, f"Failed to load page (HTTP {resp.status_code})", reason="NETWORK",
@@ -804,26 +1049,33 @@ def read_page():
 
         # Use resp.text directly instead of robust_decode to avoid encoding issues
         html = resp.text or robust_decode(resp.content, fallback_text="")
+        remaining = hard_limit - (time.time() - start_ts)
         block_marker = None if used_reader else detect_soft_block(html)
-        if block_marker:
-            reader_resp = FETCH_MANAGER.fetch_reader(url, timeout=20, max_retries=2)
-            if reader_resp and reader_resp.status_code == 200:
-                resp = reader_resp
-                used_reader = True
-                html = resp.text or robust_decode(resp.content, fallback_text="")
-            else:
-                # If reader also fails, still try to extract what we can from the original response
-                pass
+        if block_marker and remaining > 2:
+            try:
+                reader_resp = fetch_with_hard_timeout(
+                    lambda: FETCH_MANAGER.fetch_reader(url, timeout=reader_timeout, max_retries=reader_retries),
+                    remaining - 1)
+                if reader_resp and reader_resp.status_code == 200:
+                    resp = reader_resp
+                    used_reader = True
+                    html = resp.text or robust_decode(resp.content, fallback_text="")
+            except TimeoutError:
+                pass  # continue with original response
         schema_blocks = extract_schema_markup(html)
-        if not used_reader and len(html) < 200:
-            # Very short HTML might indicate an error page, but don't fail immediately
-            # Let's try reader as a fallback
-            reader_resp = FETCH_MANAGER.fetch_reader(url, timeout=20, max_retries=2)
-            if reader_resp and reader_resp.status_code == 200:
-                resp = reader_resp
-                used_reader = True
-                html = resp.text or robust_decode(resp.content, fallback_text="")
-                schema_blocks = extract_schema_markup(html)
+        remaining = hard_limit - (time.time() - start_ts)
+        if not used_reader and len(html) < 200 and remaining > 2:
+            try:
+                reader_resp = fetch_with_hard_timeout(
+                    lambda: FETCH_MANAGER.fetch_reader(url, timeout=reader_timeout, max_retries=reader_retries),
+                    remaining - 1)
+                if reader_resp and reader_resp.status_code == 200:
+                    resp = reader_resp
+                    used_reader = True
+                    html = resp.text or robust_decode(resp.content, fallback_text="")
+                    schema_blocks = extract_schema_markup(html)
+            except TimeoutError:
+                pass  # continue with what we have
 
         # Sitemap-only mode: return list of URLs as JSON, nothing else
         if is_sitemap:
