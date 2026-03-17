@@ -21,7 +21,8 @@ app = Flask(__name__)
 # ────────────────────────────────────────────────────────────────────────────────
 # Structured JSON request logging
 # ────────────────────────────────────────────────────────────────────────────────
-logging.basicConfig(level=logging.INFO, format="%(message)s")
+import sys
+logging.basicConfig(level=logging.INFO, format="%(message)s", stream=sys.stdout)
 logger = logging.getLogger("pagescraper")
 
 # ────────────────────────────────────────────────────────────────────────────────
