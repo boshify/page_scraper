@@ -6,6 +6,8 @@ import os
 import re
 import json
 import time
+import hmac
+import hashlib
 import logging
 import concurrent.futures
 from collections import defaultdict
@@ -24,6 +26,162 @@ app = Flask(__name__)
 import sys
 logging.basicConfig(level=logging.INFO, format="%(message)s", stream=sys.stdout)
 logger = logging.getLogger("pagescraper")
+
+# ────────────────────────────────────────────────────────────────────────────────
+# API key gating — only callers holding a valid key may use the scraper
+# ────────────────────────────────────────────────────────────────────────────────
+def _env_flag(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+class APIKeyRegistry:
+    """Validates caller-supplied API keys against keys configured in the environment.
+
+    Railway variables:
+      API_KEYS         comma-separated list. Each entry is either `key` or
+                       `label:key`, e.g. `n8n:sk_live_abc,zapier:sk_live_def`.
+                       Labels are only used for logging/attribution and are never
+                       secret. Key values must not contain a comma or a colon.
+      API_KEY          single-key alias; merged with API_KEYS.
+      REQUIRE_API_KEY  set to `false` to turn gating off (default: true).
+
+    Keys are compared with hmac.compare_digest so a wrong key cannot be recovered
+    by timing the response.
+    """
+
+    def __init__(self):
+        self.required = _env_flag("REQUIRE_API_KEY", True)
+        self.keys = self._load_keys()
+
+    @staticmethod
+    def _load_keys() -> dict:
+        keys = {}
+        for raw in (os.environ.get("API_KEYS", ""), os.environ.get("API_KEY", "")):
+            for entry in (raw or "").replace("\n", ",").split(","):
+                entry = entry.strip()
+                if not entry:
+                    continue
+                label, sep, secret = entry.partition(":")
+                if sep:
+                    label, secret = label.strip(), secret.strip()
+                else:
+                    label, secret = "", entry
+                if not secret:
+                    continue
+                if not label:
+                    label = "key-" + hashlib.sha256(secret.encode("utf-8")).hexdigest()[:8]
+                keys[secret] = label
+        return keys
+
+    def configured(self) -> bool:
+        return bool(self.keys)
+
+    def resolve(self, presented):
+        """Return the label for a valid key, or None if the key is unknown."""
+        if not presented:
+            return None
+        for secret, label in self.keys.items():
+            try:
+                if hmac.compare_digest(presented, secret):
+                    return label
+            except TypeError:
+                # Non-ASCII input can't match an ASCII key
+                continue
+        return None
+
+
+API_KEYS = APIKeyRegistry()
+
+# Paths that stay reachable without a key (health checks / uptime pings).
+PUBLIC_PATHS = {"/", "/favicon.ico"}
+
+
+def extract_api_key(req):
+    """Pull the caller's key from (in order) Authorization, X-API-Key, query, body."""
+    auth = (req.headers.get("Authorization") or "").strip()
+    if auth:
+        scheme, sep, value = auth.partition(" ")
+        if sep and scheme.lower() in {"bearer", "token", "apikey", "api-key"}:
+            if value.strip():
+                return value.strip()
+        elif not sep:
+            return auth  # bare key sent as the Authorization value
+
+    for header in ("X-API-Key", "X-Auth-Token", "Api-Key"):
+        value = req.headers.get(header)
+        if value and value.strip():
+            return value.strip()
+
+    value = req.args.get("api_key") or req.args.get("apikey")
+    if value and value.strip():
+        return value.strip()
+
+    if req.method in {"POST", "PUT", "PATCH"}:
+        body = req.get_json(force=True, silent=True)
+        if isinstance(body, dict):
+            for field in ("api_key", "apiKey", "API Key", "api key"):
+                value = body.get(field)
+                if isinstance(value, str) and value.strip():
+                    return value.strip()
+    return None
+
+
+def _auth_error(reason: str, message: str, status: int):
+    resp = jsonify({"ok": False, "reason": reason, "message": message})
+    resp.status_code = status
+    if status == 401:
+        resp.headers["WWW-Authenticate"] = 'Bearer realm="page_scraper"'
+    return resp
+
+
+def _enforce_api_key():
+    """Returns a rejection response, or None when the caller is authorised."""
+    if not API_KEYS.required:
+        return None
+
+    if not API_KEYS.configured():
+        # Fail closed: an unconfigured server is never silently public.
+        return _auth_error(
+            "SERVER_MISCONFIGURED",
+            "API key gating is enabled but no keys are configured. "
+            "Set API_KEYS in the Railway service variables.",
+            503,
+        )
+
+    presented = extract_api_key(request)
+    if not presented:
+        return _auth_error(
+            "MISSING_API_KEY",
+            "Missing API key. Send it as `Authorization: Bearer <key>`, an "
+            "`X-API-Key` header, or an `api_key` field in the JSON body.",
+            401,
+        )
+
+    label = API_KEYS.resolve(presented)
+    if label is None:
+        return _auth_error("INVALID_API_KEY", "Invalid API key.", 401)
+
+    g.api_key_label = label
+    return None
+
+
+logger.info(json.dumps({
+    "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    "event": "startup",
+    "api_key_required": API_KEYS.required,
+    "api_keys_loaded": len(API_KEYS.keys),
+    "api_key_labels": sorted(set(API_KEYS.keys.values())),
+}))
+if API_KEYS.required and not API_KEYS.configured():
+    logger.info(json.dumps({
+        "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "event": "startup_warning",
+        "message": "REQUIRE_API_KEY is on but API_KEYS is empty — all requests will be rejected with 503. Set API_KEYS in Railway.",
+    }))
+
 
 # ────────────────────────────────────────────────────────────────────────────────
 # Adaptive rate limiter: escalating punishment, fast rejects, good actors unaffected
@@ -78,7 +236,15 @@ class AbuseDetector:
                 del self.violations[ip]
                 self.bans.pop(ip, None)
 
-    def _caller_ip(self):
+    def _caller_id(self):
+        """Identify the caller by API key label when available, else by IP.
+
+        Keying on the key means one shared key can't dodge limits by rotating IPs,
+        and one abusive key never penalises everyone behind the same proxy.
+        """
+        label = getattr(g, "api_key_label", None)
+        if label:
+            return f"key:{label}"
         return request.headers.get("X-Forwarded-For", request.remote_addr) or "unknown"
 
     def _detect_abuse(self, ip, now):
@@ -110,7 +276,7 @@ class AbuseDetector:
     def check(self, target_url=None):
         """Returns (allowed: bool, reason: str|None, retry_after: int|None)."""
         now = time.time()
-        ip = self._caller_ip()
+        ip = self._caller_id()
         self._cleanup(now)
 
         # ── Cheapest check: active ban ──
@@ -161,6 +327,13 @@ def _pre_request():
     g.req_start = time.time()
     g.req_url = None
     g.rate_limit_reason = None
+    g.api_key_label = None
+
+    # API key gate first: unauthenticated callers never reach the scraper
+    if request.method != "OPTIONS" and request.path not in PUBLIC_PATHS:
+        denial = _enforce_api_key()
+        if denial is not None:
+            return denial
 
     # Abuse detection on POST endpoints (i.e., /read)
     if request.method == "POST":
@@ -205,6 +378,7 @@ def _log_request(response):
         "target_url": target_url,
         "target_domain": urlparse(target_url).hostname if target_url else None,
         "caller_ip": request.headers.get("X-Forwarded-For", request.remote_addr),
+        "api_key_label": getattr(g, "api_key_label", None),
         "caller_ua": request.headers.get("User-Agent"),
         "status": response.status_code,
         "ok": ok,
