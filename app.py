@@ -814,14 +814,124 @@ def choose_content_root(body_root: Tag) -> Tag:
             best, best_p = el, pcount
     return best or body_root
 
+# ── Hero / intro recovery ──────────────────────────────────────────────────────
+# choose_content_root() narrows the page to <main>, <article> or the densest <p>
+# container. Hero text that sits OUTSIDE that element (title + intro paragraph in
+# a hero <section> ahead of <main>) would be lost. collect_lead_html() recovers
+# it: when the chosen root has no <h1> of its own, everything from the first
+# usable <h1> up to the root is prepended, minus anything that looks like chrome,
+# consent UI, hidden content or non-content tags.
+LEAD_BLOCK_TAGS = {"h1","h2","h3","h4","h5","h6","p","li","blockquote"}
+LEAD_SKIP_TAGS = {
+    "script","style","noscript","template","svg","form","button","select",
+    "textarea","dialog","nav","header","footer","aside","head",
+}
+LEAD_NOISE_ATTR_RE = re.compile(
+    r"cookie|consent|gdpr|ccpa|onetrust|cookiebot|cmplz|osano|didomi|trustarc|"
+    r"termly|iubenda|truste|cc-window|cc_banner|modal|popup|pop-up|dialog|"
+    r"skip-link|screen-reader|sr-only|visually-hidden",
+    re.IGNORECASE,
+)
+LEAD_NOISE_TEXT_RE = re.compile(
+    r"cookies?|accept (all|cookies)|we use (cookies|tracking)|"
+    r"manage (cookie|preferences)|consent (to|preferences|management)|"
+    r"skip to (main )?content",
+    re.IGNORECASE,
+)
+LEAD_MAX_CHARS = 8000
+LEAD_MAX_BLOCKS = 40
+
+def _lead_excluded(el: Tag) -> bool:
+    """True if el or any ancestor is hidden, consent/modal UI, chrome or a non-content tag."""
+    node = el
+    while isinstance(node, Tag) and node.name not in ("[document]", "html"):
+        if node.name in LEAD_SKIP_TAGS:
+            return True
+        attrs = node.attrs or {}
+        if "hidden" in attrs or str(attrs.get("aria-hidden", "")).lower() == "true":
+            return True
+        if str(attrs.get("aria-modal", "")).lower() == "true":
+            return True
+        role = str(attrs.get("role", "")).lower()
+        if role in ("dialog", "alertdialog", "navigation", "banner", "contentinfo",
+                    "complementary", "search"):
+            return True
+        style = str(attrs.get("style", "")).replace(" ", "").lower()
+        if "display:none" in style or "visibility:hidden" in style:
+            return True
+        ident = " ".join([str(attrs.get("id", "")), " ".join(attrs.get("class", []) or [])])
+        if ident.strip() and (LEAD_NOISE_ATTR_RE.search(ident) or looks_chrome(node)):
+            return True
+        node = node.parent
+    return False
+
+def _direct_text(el: Tag) -> str:
+    return " ".join(str(c).strip() for c in el.children if isinstance(c, NavigableString)
+                    and not isinstance(c, Comment) and str(c).strip())
+
+def collect_lead_html(body: Tag, root: Tag) -> str:
+    """HTML of hero/intro blocks that precede `root` in document order but sit outside it."""
+    if root is None or root is body or root.name in ("body", "[document]", "html"):
+        return ""
+    if root.find("h1"):
+        return ""  # root already carries the page title; leave working pages untouched
+    elements = [e for e in body.find_all(True)]
+    try:
+        root_idx = next(i for i, e in enumerate(elements) if e is root)
+    except StopIteration:
+        return ""
+    root_ancestors = {id(a) for a in root.parents}
+
+    start = None
+    for i in range(root_idx):
+        e = elements[i]
+        if e.name == "h1" and id(e) not in root_ancestors and e.get_text(strip=True)                 and not e.find_parent("a") and not _lead_excluded(e):
+            start = i
+            break
+    if start is None:
+        return ""
+
+    picked, total = [], 0
+    for e in elements[start:root_idx]:
+        if id(e) in root_ancestors:
+            continue
+        if any(a is p for p in picked for a in e.parents):
+            continue  # already inside a picked block
+        if e.name in LEAD_BLOCK_TAGS:
+            text = e.get_text(" ", strip=True)
+        elif e.name in ("div", "span", "section") and len(_direct_text(e)) >= 40:
+            text = _direct_text(e)
+        else:
+            continue
+        if len(text) < 2 or _lead_excluded(e):
+            continue
+        if e.name not in ("h1","h2","h3","h4","h5","h6") and (
+                looks_menuish(text) or LEAD_NOISE_TEXT_RE.search(text)):
+            continue
+        if e.name in ("div", "span", "section"):
+            if e.find(list(LEAD_BLOCK_TAGS) + ["div", "section"]):
+                continue  # container of blocks: those blocks are picked on their own
+        if total + len(text) > LEAD_MAX_CHARS or len(picked) >= LEAD_MAX_BLOCKS:
+            break
+        picked.append(e)
+        total += len(text)
+    return "".join(str(e) for e in picked)
+
 def focus_body_html(body_html: str) -> str:
     """Body HTML → BeautifulSoup → drop chrome → choose content root → return focused HTML string."""
     soup = BeautifulSoup(body_html, "lxml")
     body = soup.body or soup
     drop_chrome_blocks(body)
     root = choose_content_root(body)
-    # Return just the chosen root's inner HTML (not the whole body)
-    return "".join(str(c) for c in root.contents) if root else str(body)
+    if not root:
+        return str(body)
+    # Chosen root's inner HTML, preceded by any hero/intro that sits outside it
+    try:
+        lead = collect_lead_html(body, root)
+    except Exception:
+        logger.exception("lead recovery failed; using root only")
+        lead = ""
+    return lead + "".join(str(c) for c in root.contents)
 
 # ────────────────────────────────────────────────────────────────────────────────
 # Text extraction helpers
